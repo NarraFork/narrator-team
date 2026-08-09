@@ -1,0 +1,643 @@
+/* narrator-team panel UI — styled with the host's Mantine design tokens.
+ * The host mirrors resolved --mantine-* variables into the iframe srcdoc, so
+ * this stylesheet tracks the app theme (light/dark) automatically. Fallbacks
+ * keep the panel readable if tokens are ever missing. */
+
+.nt-root {
+	font-family: var(--mantine-font-family, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif);
+	color: var(--mantine-color-text, #e9ecef);
+	background: var(--mantine-color-body, #1a1b1e);
+	min-height: 100%;
+	padding: var(--mantine-spacing-sm, 12px);
+	box-sizing: border-box;
+	font-size: var(--mantine-font-size-sm, 13px);
+	line-height: var(--mantine-line-height, 1.55);
+}
+
+.nt-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	margin-bottom: var(--mantine-spacing-xs, 8px);
+}
+
+.nt-header-actions {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	flex-shrink: 0;
+}
+
+.nt-header h1 {
+	font-family: var(--mantine-heading-font-family, inherit);
+	font-size: var(--mantine-font-size-md, 15px);
+	font-weight: 600;
+	margin: 0;
+	color: var(--mantine-color-text, #f8f9fa);
+}
+
+.nt-section {
+	margin-bottom: var(--mantine-spacing-md, 16px);
+}
+
+.nt-title {
+	font-size: var(--mantine-font-size-xs, 11px);
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.4px;
+	color: var(--mantine-color-dimmed, #909296);
+	margin: var(--mantine-spacing-sm, 12px) 0 var(--mantine-spacing-xs, 6px);
+	border-bottom: 1px solid var(--mantine-color-default-border, #2c2e33);
+	padding-bottom: 4px;
+}
+
+.nt-form {
+	display: flex;
+	flex-direction: column;
+	gap: var(--mantine-spacing-xs, 6px);
+}
+
+.nt-form label {
+	font-size: var(--mantine-font-size-xs, 12px);
+	color: var(--mantine-color-dimmed, #adb5bd);
+}
+
+.nt-form input,
+.nt-form select,
+.nt-form textarea {
+	background: var(--mantine-color-default, #25262b);
+	border: 1px solid var(--mantine-color-default-border, #373a40);
+	color: var(--mantine-color-text, #e9ecef);
+	border-radius: var(--mantine-radius-sm, 4px);
+	padding: 6px 8px;
+	font-size: var(--mantine-font-size-sm, 13px);
+	font-family: inherit;
+	box-sizing: border-box;
+	width: 100%;
+	transition: border-color 120ms ease;
+}
+
+.nt-form input:focus,
+.nt-form select:focus,
+.nt-form textarea:focus {
+	outline: none;
+	border-color: var(--mantine-primary-color-5, #4c6ef5);
+}
+
+.nt-form textarea {
+	resize: vertical;
+}
+
+.nt-checks {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	max-height: 160px;
+	overflow-y: auto;
+	border: 1px solid var(--mantine-color-default-border, #2e3036);
+	border-radius: var(--mantine-radius-sm, 4px);
+	padding: var(--mantine-spacing-xs, 6px);
+}
+
+.nt-member-check {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	font-size: var(--mantine-font-size-sm, 13px);
+	color: var(--mantine-color-text, #ced4da);
+	cursor: pointer;
+	border-radius: var(--mantine-radius-xs, 2px);
+	padding: 2px 4px;
+}
+
+.nt-member-check:hover {
+	background: var(--mantine-color-default-hover, #2b2c31);
+}
+
+.nt-member-check input {
+	width: auto;
+	accent-color: var(--mantine-primary-color-filled, #4c6ef5);
+}
+
+.nt-btn {
+	background: var(--mantine-primary-color-filled, #4c6ef5);
+	color: var(--mantine-primary-color-contrast, #fff);
+	border: none;
+	border-radius: var(--mantine-radius-sm, 4px);
+	padding: 6px 12px;
+	font-size: var(--mantine-font-size-sm, 13px);
+	font-weight: 500;
+	font-family: inherit;
+	cursor: pointer;
+	transition: background 120ms ease;
+}
+
+.nt-btn:hover:not(:disabled) {
+	background: var(--mantine-primary-color-filled-hover, #3b5bdb);
+}
+
+.nt-btn:disabled {
+	opacity: 0.6;
+	cursor: default;
+}
+
+.nt-btn-small {
+	padding: 3px 8px;
+	font-size: var(--mantine-font-size-xs, 12px);
+}
+
+.nt-notice {
+	background: var(--mantine-color-default, #2b2c31);
+	border: 1px solid var(--mantine-color-default-border, #3d3f45);
+	border-radius: var(--mantine-radius-sm, 4px);
+	padding: 6px 10px;
+	margin-bottom: var(--mantine-spacing-sm, 10px);
+	font-size: var(--mantine-font-size-xs, 12px);
+	color: var(--mantine-color-yellow-5, #ffd43b);
+}
+
+.nt-cards {
+	display: flex;
+	flex-direction: column;
+	gap: var(--mantine-spacing-xs, 6px);
+}
+
+.nt-tasks {
+	display: flex;
+	flex-direction: column;
+}
+
+.nt-card {
+	background: var(--mantine-color-default, #232428);
+	border: 1px solid var(--mantine-color-default-border, #2e3036);
+	border-radius: var(--mantine-radius-sm, 6px);
+	padding: var(--mantine-spacing-xs, 8px) var(--mantine-spacing-sm, 10px);
+}
+
+.nt-card-head {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+
+.nt-card-head strong {
+	font-size: var(--mantine-font-size-sm, 13px);
+	color: var(--mantine-color-text, #f1f3f5);
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.nt-role {
+	font-size: var(--mantine-font-size-xs, 11px);
+	color: var(--mantine-color-dimmed, #909296);
+	border: 1px solid var(--mantine-color-default-border, #373a40);
+	border-radius: var(--mantine-radius-xs, 3px);
+	padding: 0 5px;
+	white-space: nowrap;
+}
+
+.nt-badge {
+	font-size: var(--mantine-font-size-xs, 11px);
+	color: var(--mantine-color-white, #fff);
+	border-radius: var(--mantine-radius-xs, 3px);
+	padding: 1px 6px;
+	font-weight: 600;
+	white-space: nowrap;
+}
+
+/* Narrator status accents — hues match the host status registry
+ * (idle=gray, working=blue, waiting=yellow/alert, archived=dark). */
+.nt-badge-idle {
+	background: var(--mantine-color-gray-6, #868e96);
+}
+
+.nt-badge-working {
+	background: var(--mantine-color-blue-6, #228be6);
+}
+
+.nt-badge-waiting {
+	background: var(--mantine-color-yellow-6, #fab005);
+	color: var(--mantine-color-dark-9, #1a1b1e);
+}
+
+.nt-badge-archived {
+	background: var(--mantine-color-dark-4, #adb5bd);
+	color: var(--mantine-color-dark-9, #1a1b1e);
+}
+
+.nt-badge-missing {
+	background: var(--mantine-color-red-6, #fa5252);
+}
+
+.nt-badge-queued {
+	background: var(--mantine-color-yellow-6, #fab005);
+	color: var(--mantine-color-dark-9, #1a1b1e);
+}
+
+.nt-badge-sent {
+	background: var(--mantine-color-blue-6, #228be6);
+}
+
+.nt-badge-done {
+	background: var(--mantine-color-green-6, #40c057);
+}
+
+.nt-badge-failed {
+	background: var(--mantine-color-red-6, #fa5252);
+}
+
+.nt-card-meta {
+	font-size: var(--mantine-font-size-xs, 11px);
+	color: var(--mantine-color-dimmed, #868e96);
+	margin-top: 2px;
+}
+
+.nt-card-actions {
+	display: flex;
+	gap: 6px;
+	margin-top: 6px;
+}
+
+.nt-btn-danger {
+	background: transparent;
+	border: 1px solid var(--mantine-color-red-6, #fa5252);
+	color: var(--mantine-color-red-6, #fa5252);
+}
+
+.nt-btn-danger:hover:not(:disabled) {
+	background: var(--mantine-color-red-6, #fa5252);
+	color: var(--mantine-color-white, #fff);
+}
+
+/* ---- member cards (mirror the host NarratorListCard look) ---- */
+.nt-chip {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	width: 100%;
+	background: var(--mantine-color-body, #1a1b1e);
+	border: 1px solid var(--mantine-color-default-border, #2e3036);
+	border-radius: var(--mantine-radius-md, 8px);
+	box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+	padding: var(--mantine-spacing-xs, 6px) var(--mantine-spacing-sm, 10px);
+	color: var(--mantine-color-text, #e9ecef);
+	transition: transform 80ms ease, border-color 120ms ease, opacity 150ms ease;
+}
+
+.nt-chip:hover {
+	border-color: var(--mantine-color-default-border, #3d3f45);
+}
+
+/* The current narrator (the one whose chat page this panel is attached to)
+ * gets the primary accent — not the leader. The leader is identified by its
+ * yellow role pill only. */
+.nt-chip-current {
+	border-color: var(--mantine-primary-color-5, #4c6ef5);
+	background: var(--mantine-primary-color-light, #4c6ef51f);
+}
+
+.nt-chip-body {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	flex: 1;
+	min-width: 0;
+	text-align: left;
+	background: transparent;
+	border: none;
+	padding: 0;
+	cursor: pointer;
+	font-family: inherit;
+	color: inherit;
+}
+
+.nt-chip-body:active {
+	transform: scale(0.985);
+}
+
+/* Status badge — pill like the host Mantine Badge (size xs, filled) */
+.nt-chip-status {
+	flex-shrink: 0;
+	height: 18px;
+	line-height: 18px;
+	padding: 0 8px;
+	border-radius: 999px;
+	font-size: 10px;
+	font-weight: 600;
+	color: var(--mantine-color-white, #fff);
+	white-space: nowrap;
+}
+
+.nt-chip-main {
+	flex: 1;
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+}
+
+.nt-chip-title {
+	font-size: var(--mantine-font-size-sm, 13px);
+	font-weight: 500;
+	color: var(--mantine-color-text, #f1f3f5);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.nt-chip-meta {
+	font-size: var(--mantine-font-size-sm, 12px);
+	color: var(--mantine-color-dimmed, #868e96);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.nt-chip-role {
+	flex-shrink: 0;
+	height: 18px;
+	line-height: 16px;
+	padding: 0 8px;
+	border-radius: 999px;
+	border: 1px solid var(--mantine-color-default-border, #373a40);
+	font-size: 10px;
+	font-weight: 600;
+	letter-spacing: 0.3px;
+	text-transform: uppercase;
+	color: var(--mantine-color-dimmed, #909296);
+	white-space: nowrap;
+}
+
+.nt-chip-role-leader {
+	color: var(--mantine-color-yellow-5, #ffd43b);
+	border-color: var(--mantine-color-yellow-5, #ffd43b);
+}
+
+.nt-chip-icon {
+	flex-shrink: 0;
+	width: 26px;
+	height: 26px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	border-radius: var(--mantine-radius-sm, 4px);
+	border: 1px solid transparent;
+	background: transparent;
+	color: var(--mantine-color-dimmed, #909296);
+	font-size: 13px;
+	line-height: 1;
+	cursor: pointer;
+	transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.nt-chip-icon:hover {
+	background: var(--mantine-color-default-hover, #2b2c31);
+	color: var(--mantine-primary-color-5, #4c6ef5);
+	border-color: var(--mantine-color-default-border, #3d3f45);
+}
+
+.nt-modal-narrow {
+	width: min(400px, calc(100vw - 32px));
+}
+
+/* ---- leader mark (★ single-select in the picker) ---- */
+.nt-leader-mark {
+	flex-shrink: 0;
+	width: 26px;
+	height: 26px;
+	border-radius: var(--mantine-radius-sm, 4px);
+	border: 1px solid var(--mantine-color-default-border, #373a40);
+	background: transparent;
+	color: var(--mantine-color-dimmed, #868e96);
+	font-size: 13px;
+	line-height: 1;
+	cursor: pointer;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.nt-leader-mark:hover {
+	background: var(--mantine-color-default-hover, #2b2c31);
+	color: var(--mantine-color-yellow-5, #ffd43b);
+	border-color: var(--mantine-color-yellow-5, #ffd43b);
+}
+
+.nt-leader-mark.nt-leader-active {
+	background: var(--mantine-color-yellow-5, #ffd43b);
+	border-color: var(--mantine-color-yellow-5, #ffd43b);
+	color: var(--mantine-color-dark-9, #1a1b1e);
+}
+
+.nt-task {
+	background: var(--mantine-color-default, #202126);
+	border: 1px solid var(--mantine-color-default-border, #2e3036);
+	border-radius: var(--mantine-radius-sm, 6px);
+	padding: 6px 8px;
+	margin-bottom: 6px;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+	align-items: center;
+}
+
+.nt-task-id {
+	font-size: var(--mantine-font-size-xs, 11px);
+	color: var(--mantine-color-dimmed, #909296);
+	font-family: var(--mantine-font-family-monospace, ui-monospace, monospace);
+}
+
+.nt-task-member {
+	font-size: var(--mantine-font-size-xs, 11px);
+	color: var(--mantine-color-dimmed, #adb5bd);
+}
+
+.nt-task-prompt {
+	font-size: var(--mantine-font-size-sm, 12px);
+	color: var(--mantine-color-text, #dee2e6);
+	width: 100%;
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+
+.nt-task-error {
+	font-size: var(--mantine-font-size-xs, 11px);
+	color: var(--mantine-color-red-6, #fa5252);
+	width: 100%;
+}
+
+.nt-empty {
+	font-size: var(--mantine-font-size-sm, 12px);
+	color: var(--mantine-color-dimmed, #868e96);
+}
+
+/* ---- section head (title + action) ---- */
+.nt-section-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: var(--mantine-spacing-xs, 8px);
+}
+
+.nt-section-head .nt-title {
+	margin: 12px 0 6px;
+	flex: 1;
+}
+
+.nt-btn-outline {
+	background: transparent;
+	border: 1px solid var(--mantine-color-default-border, #373a40);
+	color: var(--mantine-color-text, #e9ecef);
+}
+
+.nt-btn-outline:hover:not(:disabled) {
+	background: var(--mantine-color-default-hover, #2b2c31);
+}
+
+/* ---- picker modal (styled after the host's Mantine Modal) ---- */
+.nt-modal-overlay {
+	position: fixed;
+	inset: 0;
+	background: rgba(0, 0, 0, 0.55);
+	z-index: 300;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.nt-modal {
+	background: var(--mantine-color-body, #1a1b1e);
+	border: 1px solid var(--mantine-color-default-border, #373a40);
+	border-radius: var(--mantine-radius-md, 8px);
+	box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+	width: min(480px, calc(100vw - 32px));
+	max-height: min(560px, calc(100vh - 64px));
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+}
+
+.nt-modal-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: var(--mantine-spacing-sm, 12px) var(--mantine-spacing-md, 16px);
+	border-bottom: 1px solid var(--mantine-color-default-border, #2c2e33);
+	flex-shrink: 0;
+}
+
+.nt-modal-header h3 {
+	margin: 0;
+	font-family: var(--mantine-heading-font-family, inherit);
+	font-size: var(--mantine-font-size-md, 15px);
+	font-weight: 600;
+	color: var(--mantine-color-text, #f8f9fa);
+}
+
+.nt-modal-close {
+	width: 28px;
+	height: 28px;
+	border-radius: var(--mantine-radius-sm, 4px);
+	border: none;
+	background: transparent;
+	color: var(--mantine-color-dimmed, #909296);
+	font-size: 15px;
+	line-height: 1;
+	cursor: pointer;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.nt-modal-close:hover {
+	background: var(--mantine-color-default-hover, #2b2c31);
+	color: var(--mantine-color-text, #f1f3f5);
+}
+
+.nt-modal-list {
+	flex: 1;
+	overflow-y: auto;
+	padding: var(--mantine-spacing-xs, 6px);
+	min-height: 120px;
+}
+
+.nt-narrator-row {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 8px 10px;
+	border-radius: var(--mantine-radius-sm, 6px);
+	cursor: pointer;
+	border: 1px solid transparent;
+}
+
+.nt-narrator-row:hover {
+	background: var(--mantine-color-default-hover, #2b2c31);
+}
+
+.nt-narrator-row.nt-row-selected {
+	background: var(--mantine-primary-color-light, #364fc71f);
+	border-color: var(--mantine-primary-color-3, #748ffc);
+}
+
+.nt-narrator-row.nt-row-member {
+	opacity: 0.55;
+	cursor: default;
+}
+
+.nt-narrator-dot {
+	width: 8px;
+	height: 8px;
+	border-radius: 50%;
+	flex-shrink: 0;
+}
+
+.nt-narrator-main {
+	flex: 1;
+	min-width: 0;
+}
+
+.nt-narrator-title {
+	font-size: var(--mantine-font-size-sm, 13px);
+	font-weight: 500;
+	color: var(--mantine-color-text, #f1f3f5);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.nt-narrator-sub {
+	font-size: var(--mantine-font-size-xs, 11px);
+	color: var(--mantine-color-dimmed, #868e96);
+	font-family: var(--mantine-font-family-monospace, ui-monospace, monospace);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.nt-narrator-check {
+	flex-shrink: 0;
+	font-size: var(--mantine-font-size-xs, 12px);
+	font-weight: 600;
+	color: var(--mantine-primary-color-6, #4c6ef5);
+}
+
+.nt-modal-footer {
+	display: flex;
+	justify-content: flex-end;
+	gap: var(--mantine-spacing-xs, 8px);
+	padding: var(--mantine-spacing-sm, 10px) var(--mantine-spacing-md, 16px);
+	border-top: 1px solid var(--mantine-color-default-border, #2c2e33);
+	flex-shrink: 0;
+}
+
+.nt-modal-empty {
+	text-align: center;
+	color: var(--mantine-color-dimmed, #868e96);
+	font-size: var(--mantine-font-size-sm, 13px);
+	padding: 24px 0;
+}

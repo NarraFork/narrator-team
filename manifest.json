@@ -1,0 +1,310 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "com.whisent.narrator-team",
+	"version": "0.1.37",
+	"displayName": "Narrator Team",
+	"description": "组织一个 Leader Narrator 与多个 Worker Narrator 的团队：Leader 可在会话内派发任务给成员，支持 UI 面板配置团队、查看成员状态与任务队列。",
+	"publisher": {
+		"id": "com.whisent",
+		"name": "WhiseNT"
+	},
+	"license": "Apache-2.0",
+	"engine": {
+		"runtime": "bun",
+		"runtimeVersion": ">=1.2 <2",
+		"hostApi": ">=1.0 <2",
+		"rpc": "narrafork.rpc/1",
+		"features": [
+			"host_api.requests",
+			"events.poll"
+		],
+		"os": [
+			"linux",
+			"darwin",
+			"win32"
+		],
+		"arch": [
+			"x64",
+			"arm64"
+		],
+		"runner": "local-process"
+	},
+	"server": {
+		"entry": "server/index.js",
+		"transport": "stdio",
+		"protocol": "narrafork.rpc/1",
+		"args": [],
+		"workingDirectory": "package",
+		"startupTimeoutMs": 15000,
+		"activationTimeoutMs": 30000
+	},
+	"ui": {
+		"entry": "ui/panel.iife.js",
+		"format": "iife",
+		"style": "ui/panel.css",
+		"shell": "host-controlled"
+	},
+	"activationEvents": [
+		"onTool:team.dispatch",
+		"onTool:team.status",
+		"onTool:team.report",
+		"onTool:team.recruit",
+		"onTool:team.fire",
+		"onCommand:team.configure",
+		"onView:team-panel"
+	],
+	"contributes": {
+		"providers": [],
+		"tools": [
+			{
+				"id": "team.dispatch",
+				"title": "Team: dispatch task",
+				"description": "将任务派发给团队中的某个成员 Narrator（写任务队列并发送消息）。priority 为 high 时，若成员正忙会先中断其当前工作再投递；normal 则排队等待。",
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"memberId": {
+							"type": "string",
+							"minLength": 1,
+							"maxLength": 128
+						},
+						"task": {
+							"type": "string",
+							"minLength": 1,
+							"maxLength": 4000
+						},
+						"teamId": {
+							"type": "string",
+							"maxLength": 128
+						},
+						"priority": {
+							"enum": [
+								"high",
+								"normal"
+							],
+							"default": "normal"
+						}
+					},
+					"required": [
+						"memberId",
+						"task"
+					],
+					"additionalProperties": false
+				},
+				"execution": "server",
+				"allowBackground": false
+			},
+			{
+				"id": "team.report",
+				"title": "Team: report task result",
+				"description": "团队成员在完成 Leader 指派的任务后，调用本工具向 Leader 汇报结果（标记任务完成并发送汇报消息）。Leader 在团队成员界面也能用（无任务时仅发送汇报）。",
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"teamId": {
+							"type": "string",
+							"maxLength": 128
+						},
+						"summary": {
+							"type": "string",
+							"minLength": 1,
+							"maxLength": 2000
+						}
+					},
+					"required": [
+						"summary"
+					],
+					"additionalProperties": false
+				},
+				"execution": "server",
+				"allowBackground": false
+			},
+			{
+				"id": "team.status",
+				"title": "Team: status",
+				"description": "查看团队配置、成员状态与最近任务队列。",
+				"inputSchema": {
+					"type": "object",
+					"properties": {},
+					"additionalProperties": false
+				},
+				"execution": "server",
+				"allowBackground": false
+			},
+			{
+				"id": "team.setup",
+				"title": "Team: setup",
+				"description": "配置 Narrator Team：设置名称、Leader 与成员叙述者。可只传部分字段（未传字段保持不变）。先用 team.status 获取 availableNarrators 列表，再从中选择 leaderId 与 members；leaderId 会自动加入成员。",
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"name": {
+							"type": "string",
+							"maxLength": 120
+						},
+						"leaderId": {
+							"type": "string",
+							"maxLength": 128
+						},
+						"members": {
+							"type": "array",
+							"items": {
+								"type": "string",
+								"maxLength": 128
+							},
+							"maxItems": 50
+						}
+					},
+					"additionalProperties": false
+				},
+				"execution": "server",
+				"allowBackground": false
+			},
+			{
+				"id": "team.recruit",
+				"title": "Team: recruit worker",
+				"description": "招收新工人进入团队：role 为 member（默认）时创建 primary narrator 作为正式团队成员（仅 Leader 可用）；role 为 temp 时创建 subagent 临时工（任何团队成员可用，用于任务量大时协助探索/执行，可随时用 team.fire 解雇）。创建后新成员自动加入团队。",
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"teamId": {
+							"type": "string",
+							"maxLength": 128
+						},
+						"role": {
+							"enum": [
+								"member",
+								"temp"
+							],
+							"default": "member"
+						},
+						"title": {
+							"type": "string",
+							"maxLength": 200
+						},
+						"model": {
+							"type": "string",
+							"maxLength": 200
+						},
+						"subagentType": {
+							"type": "string",
+							"maxLength": 64
+						}
+					},
+					"required": [],
+					"additionalProperties": false
+				},
+				"execution": "server",
+				"allowBackground": false
+			},
+			{
+				"id": "team.fire",
+				"title": "Team: fire worker",
+				"description": "解雇团队成员或临时工：从团队移除该成员并删除其 narrator 记录（尽力而为）。Leader 可解雇任何人；普通成员只能解雇自己招募的临时工。",
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"teamId": {
+							"type": "string",
+							"maxLength": 128
+						},
+						"memberId": {
+							"type": "string",
+							"minLength": 1,
+							"maxLength": 128
+						}
+					},
+					"required": [
+						"memberId"
+					],
+					"additionalProperties": false
+				},
+				"execution": "server",
+				"allowBackground": false
+			}
+		],
+		"commands": [
+			{
+				"id": "team.configure",
+				"title": "Team: configure",
+				"description": "配置团队：设置 Leader、成员与名称。",
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"name": {
+							"type": "string",
+							"maxLength": 120
+						},
+						"leaderId": {
+							"type": "string",
+							"maxLength": 128
+						},
+						"members": {
+							"type": "array",
+							"items": {
+								"type": "string",
+								"maxLength": 128
+							},
+							"maxItems": 50
+						}
+					},
+					"additionalProperties": false
+				},
+				"handler": "server",
+				"when": "project.exists"
+			}
+		],
+		"events": [],
+		"views": [
+			{
+				"id": "team-panel",
+				"title": "Narrator Team",
+				"entry": "ui/panel.iife.js",
+				"style": "ui/panel.css",
+				"surfaces": [
+					"focus",
+					"workspace"
+				],
+				"scope": "global",
+				"instance": "singleton",
+				"defaultPosition": "side"
+			}
+		]
+	},
+	"permissions": {
+		"host": [
+			"query.read.narrators",
+			"query.read.projects",
+			"query.read.chapters",
+			"command.narrator.send_message",
+			"command.narrator.send_subagent_message",
+			"command.narrator.interrupt",
+			"command.narrator.create",
+			"command.narrator.delete",
+			"command.narrator.spec_tasks_get",
+			"command.narrator.spec_task_add",
+			"event.subscribe",
+			"storage.read_self",
+			"storage.write_self",
+			"ui.panel",
+			"provider.use"
+		],
+		"network": {
+			"mode": "none",
+			"allow": []
+		},
+		"filesystem": {
+			"package": "readOnly",
+			"pluginData": "readWrite",
+			"workspace": "none"
+		},
+		"process": {
+			"spawn": "none"
+		}
+	},
+	"secrets": [],
+	"dependencies": {
+		"plugins": {},
+		"runtime": {}
+	}
+}
