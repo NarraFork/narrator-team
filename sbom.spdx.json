@@ -15,8 +15,8 @@
 			"versionInfo": "0.1.0",
 			"downloadLocation": "NOASSERTION",
 			"filesAnalyzed": false,
-			"licenseConcluded": "Apache-2.0",
-			"licenseDeclared": "Apache-2.0",
+			"licenseConcluded": "MIT",
+			"licenseDeclared": "MIT",
 			"copyrightText": "NOASSERTION"
 		}
 	],

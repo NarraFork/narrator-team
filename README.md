@@ -2,6 +2,8 @@
 
 面向 [NarraFork](https://github.com/NarraFork) 的团队协作插件：组织一个 **Leader 叙述者** 与多个 **Worker 叙述者** 组成的团队，在会话内直接派发任务、跟踪任务队列、查看成员忙闲状态与最近回复，并支持招募 **subagent 临时工** 拆分并行工作。
 
+> **测试性声明**：这是一个**测试性**的 NarraFork 插件，用于验证宿主插件系统与团队协作工作流；在未来可能会**并入 NarraFork 本体**。
+
 - 当前版本：`0.1.43`
 - 运行方式：local-process 插件（宿主 NarraFork 0.5.23+，公共 API 含 narrator 通道）
 
@@ -77,4 +79,4 @@ bun test
 
 ## License
 
-Apache-2.0
+MIT License — 详见 [LICENSE](./LICENSE)。

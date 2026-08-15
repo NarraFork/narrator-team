@@ -8,7 +8,7 @@
 		"id": "com.whisent",
 		"name": "WhiseNT"
 	},
-	"license": "Apache-2.0",
+	"license": "MIT",
 	"engine": {
 		"runtime": "bun",
 		"runtimeVersion": ">=1.2 <2",
