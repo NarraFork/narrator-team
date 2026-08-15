@@ -145,6 +145,229 @@ describe("task queue", () => {
 	});
 });
 
+describe("queue auto-maintenance", () => {
+	const makeTask = (id, status, memberId = "n2") =>
+		core.parseTask({ id, seq: Number(id.replace(/^task-/, "")), memberId, prompt: "p", status, assignedAt: NOW });
+
+	test("planTaskRetention keeps active tasks and prunes old finished ones", () => {
+		// Newest first: task-9..task-1; 3 active + 6 finished beyond retention.
+		const ids = ["task-9", "task-8", "task-7", "task-6", "task-5", "task-4", "task-3", "task-2", "task-1"];
+		const tasks = [
+			makeTask("task-9", "sent"),
+			makeTask("task-8", "queued"),
+			makeTask("task-7", "done"),
+			makeTask("task-6", "done"),
+			makeTask("task-5", "failed"),
+			makeTask("task-4", "done"),
+			makeTask("task-3", "done"),
+			makeTask("task-2", "done"),
+			makeTask("task-1", "failed"),
+		];
+		const index = { nextSeq: 10, ids };
+		const { retainedIndex, removeIds } = core.planTaskRetention(index, tasks);
+		// All 9 tasks fit within FINISHED_RETENTION: nothing is removed.
+		expect(removeIds).toEqual([]);
+		expect(retainedIndex.ids).toEqual(ids);
+	});
+
+	test("planTaskRetention trims beyond the retention window newest-first", () => {
+		// 35 finished tasks + 1 active. FINISHED_RETENTION=30 keeps the 30
+		// newest finished, drops the 5 oldest; active is always kept.
+		const ids = [];
+		const tasks = [];
+		for (let i = 36; i >= 1; i -= 1) {
+			const id = `task-${i}`;
+			ids.push(id);
+			tasks.push(makeTask(id, i === 36 ? "sent" : "done"));
+		}
+		const { retainedIndex, removeIds } = core.planTaskRetention({ nextSeq: 37, ids }, tasks);
+		expect(retainedIndex.ids[0]).toBe("task-36"); // active kept at front
+		expect(retainedIndex.ids.length).toBe(core.FINISHED_RETENTION + 1);
+		expect(retainedIndex.ids).toContain("task-36");
+		expect(retainedIndex.ids).toContain("task-6"); // newest 30 finished kept
+		expect(retainedIndex.ids).not.toContain("task-5");
+		expect(removeIds.sort()).toEqual(["task-1", "task-2", "task-3", "task-4", "task-5"]);
+	});
+
+	test("planTaskRetention honours QUEUE_SOFT_LIMIT when many tasks are active", () => {
+		// 40 finished + 45 active = 85 total. Finished budget shrinks to
+		// QUEUE_SOFT_LIMIT - activeCount = 5, so only the 5 newest finished stay.
+		const ids = [];
+		const tasks = [];
+		for (let i = 85; i >= 1; i -= 1) {
+			const id = `task-${i}`;
+			ids.push(id);
+			const active = i <= 45;
+			tasks.push(makeTask(id, active ? "sent" : "done"));
+		}
+		const { retainedIndex, removeIds } = core.planTaskRetention({ nextSeq: 86, ids }, tasks);
+		expect(retainedIndex.ids.length).toBe(core.QUEUE_SOFT_LIMIT);
+		expect(removeIds.length).toBe(85 - core.QUEUE_SOFT_LIMIT);
+		// Newest finished kept: task-85..task-81 (5 entries).
+		expect(retainedIndex.ids).toContain("task-81");
+		expect(retainedIndex.ids).not.toContain("task-80");
+		// All active tasks survive.
+		expect(retainedIndex.ids).toContain("task-45");
+		expect(retainedIndex.ids).toContain("task-1");
+	});
+
+	test("planTaskRetention preserves unknown ids defensively", () => {
+		const index = { nextSeq: 3, ids: ["task-3", "task-2", "task-1"] };
+		const tasks = [makeTask("task-3", "done"), makeTask("task-1", "failed")]; // task-2 missing
+		const { retainedIndex, removeIds } = core.planTaskRetention(index, tasks);
+		expect(retainedIndex.ids).toEqual(["task-3", "task-2", "task-1"]);
+		expect(removeIds).toEqual([]);
+	});
+
+	test("retireOrphanTasks retires queued/sent tasks of removed members", () => {
+		const tasks = [
+			makeTask("task-1", "sent", "n-removed"),
+			makeTask("task-2", "queued", "n-removed"),
+			makeTask("task-3", "sent", "n2"),
+			makeTask("task-4", "done", "n-removed"),
+		];
+		const plans = core.retireOrphanTasks(tasks, { memberIds: ["n1", "n2"] });
+		expect(plans.map((plan) => plan.task.id)).toEqual(["task-1", "task-2"]);
+		for (const plan of plans) {
+			expect(plan.nextStatus).toBe("failed");
+			expect(plan.error).toBe("member no longer in team");
+		}
+	});
+
+	test("retireOrphanTasks ignores unknown memberIds input", () => {
+		const tasks = [makeTask("task-1", "sent", "n2")];
+		expect(core.retireOrphanTasks(tasks, { memberIds: null })).toEqual([]);
+		expect(core.retireOrphanTasks([], { memberIds: ["n1"] })).toEqual([]);
+	});
+
+	test("retireOrphanTasks retires members deleted by the host", () => {
+		const tasks = [
+			makeTask("task-1", "queued", "n2"),
+			makeTask("task-2", "sent", "n2"),
+			makeTask("task-3", "sent", "n-removed"),
+			makeTask("task-4", "done", "n2"),
+			makeTask("task-5", "failed", "n2"),
+		];
+		const plans = core.retireOrphanTasks(tasks, {
+			memberIds: ["n1", "n2"],
+			narratorIds: ["n1"],
+		});
+		expect(plans.map((plan) => plan.task.id)).toEqual(["task-1", "task-2", "task-3"]);
+		expect(plans.slice(0, 2).every((plan) => plan.error === "member narrator no longer exists")).toBe(true);
+		expect(plans[2].error).toBe("member no longer in team");
+		expect(plans.every((plan) => plan.nextStatus === "failed")).toBe(true);
+	});
+
+	test("retireOrphanTasks does not infer deletion when the host snapshot is unavailable", () => {
+		const tasks = [makeTask("task-1", "sent", "n2")];
+		expect(core.retireOrphanTasks(tasks, { memberIds: ["n2"] })).toEqual([]);
+	});
+
+	test("retireOrphanTasks treats an empty host snapshot as authoritative", () => {
+		const tasks = [makeTask("task-1", "queued", "n2")];
+		expect(core.retireOrphanTasks(tasks, { memberIds: ["n2"], narratorIds: [] })).toMatchObject([
+			{ task: { id: "task-1" }, nextStatus: "failed", error: "member narrator no longer exists" },
+		]);
+	});
+});
+
+describe("member profile patch", () => {
+	const team = () =>
+		core.parseTeam({
+			id: "team-x",
+			name: "T",
+			leaderId: "n1",
+			members: ["n1", "n2", "n3"],
+			memberRoles: { n3: "temp" },
+			recruitedBy: { n3: "n2" },
+		});
+
+	test("leader can update any member's profile", () => {
+		const result = core.planMemberProfilePatch(
+			team(),
+			"n1",
+			{ memberId: "n2", title: "New Name", model: "claude-sonnet-4.5", reasoningEffort: "high" },
+		);
+		expect(result.ok).toBe(true);
+		if (result.ok) {
+			expect(result.plan).toMatchObject({
+				memberId: "n2",
+				title: "New Name",
+				model: "claude-sonnet-4.5",
+				reasoningEffort: "high",
+			});
+		}
+	});
+
+	test("recruiter can update their own temp worker only", () => {
+		const ok = core.planMemberProfilePatch(team(), "n2", {
+			memberId: "n3",
+			title: "Temp",
+		});
+		expect(ok.ok).toBe(true);
+
+		const denied = core.planMemberProfilePatch(team(), "n2", {
+			memberId: "n1",
+			title: "Leader",
+		});
+		expect(denied.ok).toBe(false);
+		if (!denied.ok) expect(denied.reason).toContain("Only the team leader");
+	});
+
+	test("non-leader cannot update a regular member they did not recruit", () => {
+		const result = core.planMemberProfilePatch(team(), "n3", {
+			memberId: "n2",
+			title: "x",
+		});
+		expect(result.ok).toBe(false);
+	});
+
+	test("rejects unknown members, empty patches and bad values", () => {
+		expect(core.planMemberProfilePatch(team(), "n1", { memberId: "nX", title: "x" }).ok).toBe(false);
+		expect(core.planMemberProfilePatch(team(), "n1", { memberId: "n2" }).ok).toBe(false);
+		expect(core.planMemberProfilePatch(team(), "n1", { memberId: "n2", title: "  " }).ok).toBe(false);
+		expect(core.planMemberProfilePatch(team(), "n1", { memberId: "n2", reasoningEffort: "ultra" }).ok).toBe(false);
+		expect(core.planMemberProfilePatch(team(), "n1", { memberId: "n2", title: "x".repeat(201) }).ok).toBe(false);
+		expect(
+			core.planMemberProfilePatch(team(), "n1", { memberId: "n2", model: "x".repeat(201) }).ok,
+		).toBe(false);
+	});
+
+	test("reasoningEffort null resets to default; __default__ model is allowed", () => {
+		const ok = core.planMemberProfilePatch(team(), "n1", {
+			memberId: "n2",
+			reasoningEffort: null,
+			model: "__default__",
+		});
+		expect(ok.ok).toBe(true);
+		if (ok.ok) {
+			expect(ok.plan.reasoningEffort).toBeNull();
+			expect(ok.plan.model).toBe("__default__");
+		}
+	});
+
+	test("spec patch validates uri whitelist and content", () => {
+		const good = core.planMemberProfilePatch(team(), "n1", {
+			memberId: "n2",
+			spec: { uri: "index.md", content: "# Hello" },
+		});
+		expect(good.ok).toBe(true);
+		if (good.ok) expect(good.plan.spec).toEqual({ uri: "index.md", content: "# Hello" });
+
+		const badUri = core.planMemberProfilePatch(team(), "n1", {
+			memberId: "n2",
+			spec: { uri: "behavior_fence", content: "x" },
+		});
+		expect(badUri.ok).toBe(false);
+
+		const empty = core.planMemberProfilePatch(team(), "n1", {
+			memberId: "n2",
+			spec: { uri: "tasks.json", content: "" },
+		});
+		expect(empty.ok).toBe(false);
+	});
+});
+
 describe("planDispatch", () => {
 	const config = core.parseTeamConfig({ name: "T", leaderId: "n1", members: ["n2", "n3"] });
 	const index = { nextSeq: 3, ids: ["task-2", "task-1"] };
@@ -374,6 +597,78 @@ describe("multi-team model", () => {
 		});
 		expect(migrated.tasks.map((task) => task.id)).toEqual(["task-2", "task-1"]);
 		expect(migrated.index).toEqual({ nextSeq: 3, ids: ["task-2", "task-1"] });
+	});
+});
+
+describe("collaboration visibility & follow-up", () => {
+	test("summarizeReplies picks the newest assistant text and truncates", () => {
+		expect(core.summarizeReplies([])).toBeNull();
+		expect(core.summarizeReplies(null)).toBeNull();
+		expect(
+			core.summarizeReplies([
+				{ role: "user", text: "task" },
+				{ role: "assistant", text: "  done  " },
+			]),
+		).toBe("done");
+		// Newest first: the first assistant entry wins.
+		expect(
+			core.summarizeReplies([
+				{ role: "assistant", text: "second reply" },
+				{ role: "assistant", text: "first reply" },
+			]),
+		).toBe("second reply");
+		// Truncation with ellipsis (character-aware for CJK).
+		const long = "字".repeat(310);
+		const summarized = core.summarizeReplies([{ role: "assistant", text: long }], 300);
+		expect(summarized?.endsWith("…")).toBe(true);
+		expect([...summarized.slice(0, -1)].length).toBe(300);
+	});
+
+	test("followUpPrompt carries the task prefix and instruction", () => {
+		const task = { id: "task-3", prompt: "original" };
+		expect(core.followUpPrompt(task, " 再检查一下边界  ")).toBe(
+			"[团队任务 task-3] Leader 追加指令：再检查一下边界",
+		);
+		expect(core.followUpPrompt(task, "")).toContain("(无补充说明)");
+	});
+
+	test("appendFollowUp keeps newest entries and caps the thread", () => {
+		const task = { id: "task-1", prompt: "p" };
+		const now = "2026-08-08T13:00:00.000Z";
+		const one = core.appendFollowUp(task, {
+			fromId: "n-leader",
+			toId: "n-worker",
+			text: "do it",
+			now,
+		});
+		expect(one.followUps).toEqual([
+			{ fromId: "n-leader", toId: "n-worker", text: "do it", at: now },
+		]);
+		// Original task unchanged (immutability).
+		expect(task.followUps).toBeUndefined();
+
+		// Cap: only the newest FOLLOW_UP_LIMIT entries remain.
+		let t = task;
+		for (let i = 0; i < core.FOLLOW_UP_LIMIT + 5; i++) {
+			t = core.appendFollowUp(t, {
+				fromId: "n-leader",
+				toId: "n-worker",
+				text: `m${i}`,
+				now,
+			});
+		}
+		expect(t.followUps.length).toBe(core.FOLLOW_UP_LIMIT);
+		expect(t.followUps[0].text).toBe("m5");
+		expect(t.followUps[t.followUps.length - 1].text).toBe(`m${core.FOLLOW_UP_LIMIT + 4}`);
+	});
+
+	test("promptMentionsPath matches full path or basename case-insensitively", () => {
+		expect(core.promptMentionsPath("src/worker.ts", "fix the worker")).toBe(true);
+		expect(core.promptMentionsPath("src/Worker.TS", "fix worker")).toBe(true);
+		expect(core.promptMentionsPath("src/a/b.ts", "check src/a/b.ts carefully")).toBe(true);
+		expect(core.promptMentionsPath("src/unrelated.ts", "fix the worker")).toBe(false);
+		expect(core.promptMentionsPath("", "anything")).toBe(false);
+		expect(core.promptMentionsPath("a.ts", null)).toBe(false);
 	});
 });
 

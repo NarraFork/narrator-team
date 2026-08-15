@@ -1,7 +1,7 @@
 {
 	"schemaVersion": 1,
 	"pluginId": "com.whisent.narrator-team",
-	"version": "0.1.37",
+	"version": "0.1.43",
 	"displayName": "Narrator Team",
 	"description": "组织一个 Leader Narrator 与多个 Worker Narrator 的团队：Leader 可在会话内派发任务给成员，支持 UI 面板配置团队、查看成员状态与任务队列。",
 	"publisher": {
@@ -50,6 +50,7 @@
 		"onTool:team.report",
 		"onTool:team.recruit",
 		"onTool:team.fire",
+		"onTool:team.update_member",
 		"onCommand:team.configure",
 		"onView:team-panel"
 	],
@@ -59,7 +60,7 @@
 			{
 				"id": "team.dispatch",
 				"title": "Team: dispatch task",
-				"description": "将任务派发给团队中的某个成员 Narrator（写任务队列并发送消息）。priority 为 high 时，若成员正忙会先中断其当前工作再投递；normal 则排队等待。",
+				"description": "将任务派发给团队中的某个成员 Narrator（写任务队列并发送消息）。priority 为 high 时，若成员正忙会先中断其当前工作再投递；normal 则排队等待。你是 Leader 时应倾向于主动把任务派发给成员（而非自己执行）：派发前先用 team.status 查看成员状态；任务紧急且成员正忙时才用 priority=high（会打断其当前工作），普通任务用 normal（排队等待）。对已派发且正在执行的任务，可用 followUp=true 追加指令或追问（不新建任务，成员收到 [团队任务] Leader 追加指令 后会继续执行）；追加指令只对 Leader 开放。",
 				"inputSchema": {
 					"type": "object",
 					"properties": {
@@ -83,6 +84,11 @@
 								"normal"
 							],
 							"default": "normal"
+						},
+						"followUp": {
+							"type": "boolean",
+							"default": false,
+							"description": "true 时把 task 作为对成员当前任务的追加指令/追问（仅 Leader 可用，不新建任务，记录到任务线程 followUps）"
 						}
 					},
 					"required": [
@@ -97,7 +103,7 @@
 			{
 				"id": "team.report",
 				"title": "Team: report task result",
-				"description": "团队成员在完成 Leader 指派的任务后，调用本工具向 Leader 汇报结果（标记任务完成并发送汇报消息）。Leader 在团队成员界面也能用（无任务时仅发送汇报）。",
+				"description": "团队成员在完成 Leader 指派的任务后，调用本工具向 Leader 汇报结果（标记任务完成并发送汇报消息）。Leader 在团队成员界面也能用（无任务时仅发送汇报）。完成任务后必须调用本工具向 Leader 汇报结果摘要。",
 				"inputSchema": {
 					"type": "object",
 					"properties": {
@@ -122,7 +128,7 @@
 			{
 				"id": "team.status",
 				"title": "Team: status",
-				"description": "查看团队配置、成员状态与最近任务队列。",
+				"description": "查看团队配置、成员状态与最近任务队列。每个成员带 recentReply（其最近一次回复的实质内容摘要），可据此了解进展而不必打开聊天页；任务带 followUps（Leader 追加指令/追问的对话线程）。派发任务或做团队决策前，先用本工具查看成员状态与队列，再决定目标成员与优先级。需要调整进行中的任务时，用 team.dispatch 的 followUp=true 追加指令。",
 				"inputSchema": {
 					"type": "object",
 					"properties": {},
@@ -163,7 +169,7 @@
 			{
 				"id": "team.recruit",
 				"title": "Team: recruit worker",
-				"description": "招收新工人进入团队：role 为 member（默认）时创建 primary narrator 作为正式团队成员（仅 Leader 可用）；role 为 temp 时创建 subagent 临时工（任何团队成员可用，用于任务量大时协助探索/执行，可随时用 team.fire 解雇）。创建后新成员自动加入团队。",
+				"description": "招收新工人进入团队：role 为 member（默认）时创建 primary narrator 作为正式团队成员（仅 Leader 可用）；role 为 temp 时创建 subagent 临时工（任何团队成员可用，用于任务量大时协助探索/执行，可随时用 team.fire 解雇）。任务规模大（跨多文件/多模块/需并行探索）时可招 role=temp 临时工拆分子任务。创建后新成员自动加入团队。",
 				"inputSchema": {
 					"type": "object",
 					"properties": {
@@ -200,7 +206,7 @@
 			{
 				"id": "team.fire",
 				"title": "Team: fire worker",
-				"description": "解雇团队成员或临时工：从团队移除该成员并删除其 narrator 记录（尽力而为）。Leader 可解雇任何人；普通成员只能解雇自己招募的临时工。",
+				"description": "解雇团队成员或临时工：从团队移除该成员并删除其 narrator 记录（尽力而为）。Leader 可解雇任何人；普通成员只能解雇自己招募的临时工。临时工完成任务或不再需要时请及时解雇，保持团队精简。",
 				"inputSchema": {
 					"type": "object",
 					"properties": {
@@ -212,6 +218,71 @@
 							"type": "string",
 							"minLength": 1,
 							"maxLength": 128
+						}
+					},
+					"required": [
+						"memberId"
+					],
+					"additionalProperties": false
+				},
+				"execution": "server",
+				"allowBackground": false
+			},
+			{
+				"id": "team.update_member",
+				"title": "Team: update member profile",
+				"description": "修改团队成员叙述者的资料：名称（title）、模型（model，可用 __default__ 跟随全局默认）、思考强度（reasoningEffort：none/low/medium/high/xhigh/max，null 恢复默认）、以及 Dynamic Spec 文件（spec.uri 仅支持 tasks.json / index.md，spec.content 为新内容）。仅 Leader 可修改成员；成员仅可修改自己招募的临时工。至少提供一项修改。",
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"teamId": {
+							"type": "string",
+							"maxLength": 128
+						},
+						"memberId": {
+							"type": "string",
+							"minLength": 1,
+							"maxLength": 128
+						},
+						"title": {
+							"type": "string",
+							"minLength": 1,
+							"maxLength": 200
+						},
+						"model": {
+							"type": "string",
+							"minLength": 1,
+							"maxLength": 200
+						},
+						"reasoningEffort": {
+							"enum": [
+								"none",
+								"low",
+								"medium",
+								"high",
+								"xhigh",
+								"max"
+							],
+							"type": "string"
+						},
+						"spec": {
+							"type": "object",
+							"properties": {
+								"uri": {
+									"type": "string",
+									"minLength": 1,
+									"maxLength": 256
+								},
+								"content": {
+									"type": "string",
+									"maxLength": 262144
+								}
+							},
+							"required": [
+								"uri",
+								"content"
+							],
+							"additionalProperties": false
 						}
 					},
 					"required": [
@@ -281,9 +352,12 @@
 			"command.narrator.interrupt",
 			"command.narrator.create",
 			"command.narrator.delete",
-			"command.narrator.spec_tasks_get",
-			"command.narrator.spec_task_add",
-			"event.subscribe",
+		"command.narrator.spec_tasks_get",
+		"command.narrator.spec_task_add",
+		"command.narrator.spec_behavior_fence_update",
+		"command.narrator.update_profile",
+		"command.narrator.spec_write",
+		"event.subscribe",
 			"storage.read_self",
 			"storage.write_self",
 			"ui.panel",

@@ -32,7 +32,31 @@ import {
 import { LocalProcessRunner, PluginRuntime } from "../../../narrafork/server/services/plugin-runtime";
 import { PluginStorageFactory } from "../../../narrafork/server/services/plugin-storage";
 import { cleanDb, getTestDb } from "../../../narrafork/tests/setup";
-import { chapters, narrators, projects } from "../../../narrafork/server/db/schema";
+import { eq } from "../../../narrafork/node_modules/drizzle-orm";
+import {
+	apiRequests,
+	backgroundTasks,
+	benchmarkTaskResults,
+	chapters,
+	chapterCommits,
+	fileAttributions,
+	gatewaySessionMappings,
+	narratorBlacklistCmds,
+	narratorBlacklistDirs,
+	narratorBufferedMessages,
+	narratorFileSnapshots,
+	narratorMessageRefs,
+	narratorMessages,
+	narratorPatches,
+	narratorToolCalls,
+	narratorWhitelistCmds,
+	narratorWhitelistDirs,
+	narrators,
+	projects,
+	terminalTabs,
+	terminalViewState,
+	terminals,
+} from "../../../narrafork/server/db/schema";
 
 const PLUGIN_ID = "com.whisent.narrator-team";
 const PLUGIN_ROOT = resolve(import.meta.dir, "..");
@@ -125,7 +149,7 @@ const fakeSession = {
 	},
 	async deleteNarrator(narratorId) {
 		deletedNarrators.push(narratorId);
-		db.delete(narrators).where({ id: narratorId }).run();
+		db.delete(narrators).where(eq(narrators.id, narratorId)).run();
 		return { deleted: true };
 	},
 	interruptNarrator() {
@@ -133,6 +157,20 @@ const fakeSession = {
 	},
 	async getById(id) {
 		return { id };
+	},
+	async updateProfile(narratorId, patch) {
+		const set = {
+			...(patch.title !== undefined ? { title: patch.title } : {}),
+			...(patch.model !== undefined ? { model: patch.model } : {}),
+			...(patch.reasoningEffort !== undefined ? { reasoningEffort: patch.reasoningEffort } : {}),
+			updatedAt: new Date().toISOString(),
+		};
+		db.update(narrators).set(set).where(eq(narrators.id, narratorId)).run();
+		return { updated: Object.keys(patch) };
+	},
+	async specWrite(narratorId, uri, content) {
+		specQueues.set(`spec-file:${narratorId}:${uri}`, content);
+		return { path: uri, uri: `spec://${uri}`, revisionId: "r-spec-1" };
 	},
 };
 
@@ -162,6 +200,9 @@ const CAPABILITIES = [
 	"command.narrator.delete",
 	"command.narrator.spec_tasks_get",
 	"command.narrator.spec_task_add",
+	"command.narrator.spec_behavior_fence_update",
+	"command.narrator.update_profile",
+	"command.narrator.spec_write",
 	"storage.read_self",
 	"storage.write_self",
 	"ui.panel",
@@ -275,7 +316,7 @@ beforeAll(async () => {
 	});
 	const binding = hostServices.bindRuntime({
 		pluginId: PLUGIN_ID,
-		packageVersion: "0.1.37",
+		packageVersion: "0.1.42",
 		installationId: "installation-e2e",
 		runtimeId: "runtime-e2e",
 		runtimeGeneration: 1,
@@ -290,7 +331,7 @@ beforeAll(async () => {
 	// Spawn the actual plugin process and wire its host-facing dispatcher.
 	pluginRuntime = new PluginRuntime({
 		pluginId: PLUGIN_ID,
-		pluginVersion: "0.1.37",
+		pluginVersion: "0.1.42",
 		installationId: "installation-e2e",
 		runtimeId: "runtime-e2e",
 		command: [process.execPath, join(PLUGIN_ROOT, "server/index.js")],
@@ -431,6 +472,7 @@ describe("narrator-team end-to-end", () => {
 		expect(sent[0].narratorId).toBe("n-worker");
 		expect(sent[0].prompt).toContain("review chapter 3 and report back");
 		expect(sent[0].prompt).toContain("[团队任务 task-1（normal）]");
+		expect(sent[0].prompt).toContain("[团队协作准则 · Worker]"); // role SOP appended
 		expect(sent[0].locale).toBe("en");
 		expect(sent[0].originLabel).toBe(`plugin:${PLUGIN_ID}`);
 
@@ -598,6 +640,7 @@ describe("narrator-team end-to-end", () => {
 		// though the subagent was never started by a parent Agent tool call.
 		expect(subagentSent).toHaveLength(2);
 		expect(subagentSent[1].subagentId).toBe(tempId);
+		expect(subagentSent[1].message).toContain("[团队协作准则 · 临时工]"); // temp role SOP appended
 		const task = readStored(`team.${teamAId}.tasks.5`);
 		expect(task).toMatchObject({ id: "task-5", seq: 5, memberId: tempId, status: "sent" });
 	});
@@ -629,6 +672,15 @@ describe("narrator-team end-to-end", () => {
 		).rejects.toThrow(/Only the team leader/);
 	});
 
+	test("team.fire retires the fired member's queued/sent tasks as failed", async () => {
+		// task-5 targeted the temp worker that was fired above. Auto-maintenance
+		// inside team.fire must retire its active task (member no longer in
+		// team) so it can never be delivered again.
+		const task5 = readStored(`team.${teamAId}.tasks.5`);
+		expect(task5.status).toBe("failed");
+		expect(task5.error).toBe("member no longer in team");
+	});
+
 	test("team.status closes a task when the member marks it done in their spec queue", async () => {
 		// The member completes task-5 in their own spec://tasks.json.
 		const tempId = createdNarrators[1].id; // fired earlier — its queue is gone
@@ -654,5 +706,146 @@ describe("narrator-team end-to-end", () => {
 		await invoke("team.status", { teamId: teamAId }, "n-leader");
 		const task3Record = readStored(`team.${teamAId}.tasks.3`);
 		expect(task3Record.status).toBe("failed");
+	});
+
+	test("team.update_member lets the leader change a member's profile", async () => {
+		const result = await invoke(
+			"team.update_member",
+			{
+				teamId: teamAId,
+				memberId: "n-worker",
+				title: "Worker Prime",
+				model: "claude-sonnet-4.5",
+				reasoningEffort: "high",
+			},
+			"n-leader",
+		);
+		expect(result.error).toBeUndefined();
+		const output = JSON.parse(result.output);
+		expect(output.ok).toBe(true);
+		expect(output.memberId).toBe("n-worker");
+		expect(output.updated.sort()).toEqual(["model", "reasoningEffort", "title"]);
+
+		// Persisted through the host's narrator adapter (fake session → DB).
+		const row = db.select().from(narrators).where(eq(narrators.id, "n-worker")).get();
+		expect(row?.title).toBe("Worker Prime");
+		expect(row?.model).toBe("claude-sonnet-4.5");
+		expect(row?.reasoningEffort).toBe("high");
+	});
+
+	test("team.update_member rejects a non-leader updating another member", async () => {
+		// n-worker is a teamA member but not the leader; it may only update temp
+		// workers it recruited, never the leader or other regular members.
+		await expect(
+			invoke(
+				"team.update_member",
+				{ teamId: teamAId, memberId: "n-leader", title: "Hijacked" },
+				"n-worker",
+			),
+		).rejects.toThrow(/Only the team leader/);
+	});
+
+	test("team.update_member writes a whitelisted spec file", async () => {
+		const result = await invoke(
+			"team.update_member",
+			{
+				teamId: teamAId,
+				memberId: "n-worker",
+				spec: { uri: "index.md", content: "# Updated index" },
+			},
+			"n-leader",
+		);
+		expect(result.error).toBeUndefined();
+		const output = JSON.parse(result.output);
+		expect(output.spec).toEqual({ uri: "index.md", revisionId: "r-spec-1" });
+		expect(specQueues.get("spec-file:n-worker:index.md")).toBe("# Updated index");
+	});
+
+	test("team.update_member rejects a non-whitelisted spec uri", async () => {
+		await expect(
+			invoke(
+				"team.update_member",
+				{
+					teamId: teamAId,
+					memberId: "n-worker",
+					spec: { uri: "behavior_fence", content: "x" },
+				},
+				"n-leader",
+			),
+		).rejects.toThrow(/spec.uri must be one of/);
+	});
+
+	test("host-deleted members retire orphan tasks and cannot receive new dispatches", async () => {
+		const beforeSent = sent.length;
+		const beforeSubagentSent = subagentSent.length;
+		const result = await invoke(
+			"team.dispatch",
+			{ teamId: teamAId, memberId: "n-worker", task: "queued before host deletion" },
+			"n-leader",
+		);
+		expect(result.error).toBeUndefined();
+		expect(JSON.parse(result.output).status).toBe("sent");
+		const task6 = readStored(`team.${teamAId}.tasks.6`);
+		expect(task6).toMatchObject({ memberId: "n-worker", status: "sent" });
+		expect(sent.length).toBe(beforeSent + 1);
+		expect(subagentSent.length).toBe(beforeSubagentSent);
+
+		// Simulate host-side deletion without changing the persisted team config.
+		// This mirrors narratorService.remove's FK cleanup, while deliberately
+		// bypassing the plugin's team.fire path.
+		const workerMessageIds = db
+			.select({ id: narratorMessages.id })
+			.from(narratorMessages)
+			.where(eq(narratorMessages.narratorId, "n-worker"))
+			.all()
+			.map((row) => row.id);
+		db.delete(terminalViewState).where(eq(terminalViewState.narratorId, "n-worker")).run();
+		db.delete(terminalTabs).where(eq(terminalTabs.narratorId, "n-worker")).run();
+		db.delete(terminals).where(eq(terminals.narratorId, "n-worker")).run();
+		db.delete(narratorBufferedMessages).where(eq(narratorBufferedMessages.narratorId, "n-worker")).run();
+		db.delete(narratorFileSnapshots).where(eq(narratorFileSnapshots.narratorId, "n-worker")).run();
+		db.delete(narratorPatches).where(eq(narratorPatches.narratorId, "n-worker")).run();
+		db.delete(narratorWhitelistDirs).where(eq(narratorWhitelistDirs.narratorId, "n-worker")).run();
+		db.delete(narratorBlacklistDirs).where(eq(narratorBlacklistDirs.narratorId, "n-worker")).run();
+		db.delete(narratorWhitelistCmds).where(eq(narratorWhitelistCmds.narratorId, "n-worker")).run();
+		db.delete(narratorBlacklistCmds).where(eq(narratorBlacklistCmds.narratorId, "n-worker")).run();
+		db.delete(apiRequests).where(eq(apiRequests.narratorId, "n-worker")).run();
+		db.update(chapterCommits).set({ narratorId: null }).where(eq(chapterCommits.narratorId, "n-worker")).run();
+		db.update(benchmarkTaskResults).set({ narratorId: null }).where(eq(benchmarkTaskResults.narratorId, "n-worker")).run();
+		db.update(fileAttributions).set({ narratorId: null }).where(eq(fileAttributions.narratorId, "n-worker")).run();
+		db.delete(gatewaySessionMappings).where(eq(gatewaySessionMappings.narratorId, "n-worker")).run();
+		db.delete(backgroundTasks).where(eq(backgroundTasks.subagentNarratorId, "n-worker")).run();
+		db.delete(backgroundTasks).where(eq(backgroundTasks.parentNarratorId, "n-worker")).run();
+		db.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, "n-worker")).run();
+		db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, "n-worker")).run();
+		if (workerMessageIds.length > 0) {
+			db.update(narrators).set({ forkMessageId: null, pruneBoundaryMessageId: null }).where(eq(narrators.id, "n-worker")).run();
+			db.delete(narratorSidecars).where(eq(narratorSidecars.narratorId, "n-worker")).run();
+			db.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, "n-worker")).run();
+			db.delete(narratorMessages).where(eq(narratorMessages.narratorId, "n-worker")).run();
+		}
+		db.delete(narrators).where(eq(narrators.id, "n-worker")).run();
+
+		const status = JSON.parse((await invoke("team.status", { teamId: teamAId }, "n-leader")).output);
+		const task6Record = readStored(`team.${teamAId}.tasks.6`);
+		expect(task6Record).toMatchObject({
+			status: "failed",
+			error: "member narrator no longer exists",
+		});
+		expect(status.teams[0].members.find((member) => member.id === "n-worker")).toMatchObject({
+			id: "n-worker",
+			status: "missing",
+		});
+
+		const dispatchRequest = invoke(
+			"team.dispatch",
+			{ teamId: teamAId, memberId: "n-worker", task: "must not be delivered" },
+			"n-leader",
+		);
+		await expect(dispatchRequest).rejects.toThrow(/Member narrator no longer exists/);
+		expect(sent.length).toBe(beforeSent + 1);
+		expect(subagentSent.length).toBe(beforeSubagentSent);
+		const queue = JSON.parse((await invoke("team.status", { teamId: teamAId }, "n-leader")).output).teams[0].queue;
+		expect(queue.some((task) => task.memberId === "n-worker" && task.status === "queued")).toBe(false);
 	});
 });

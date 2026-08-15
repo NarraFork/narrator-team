@@ -356,6 +356,16 @@
 	white-space: nowrap;
 }
 
+/* Collaboration visibility: the member's latest reply preview. */
+.nt-chip-reply {
+	font-size: var(--mantine-font-size-sm, 12px);
+	color: var(--mantine-color-teal-5, #12b886);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	display: block;
+}
+
 .nt-chip-role {
 	flex-shrink: 0;
 	height: 18px;
@@ -468,6 +478,34 @@
 	font-size: var(--mantine-font-size-xs, 11px);
 	color: var(--mantine-color-red-6, #fa5252);
 	width: 100%;
+}
+
+/* Task delete (hover ✕ + right-click affordance) */
+.nt-task {
+	position: relative;
+}
+.nt-task-delete {
+	position: absolute;
+	top: 4px;
+	right: 4px;
+	border: none;
+	background: transparent;
+	color: var(--mantine-color-dimmed, #909296);
+	font-size: 12px;
+	line-height: 1;
+	padding: 2px 4px;
+	border-radius: var(--mantine-radius-sm, 4px);
+	cursor: pointer;
+	opacity: 0;
+	transition: opacity 120ms ease;
+}
+.nt-task:hover .nt-task-delete,
+.nt-task-delete:focus {
+	opacity: 1;
+}
+.nt-task-delete:hover {
+	color: var(--mantine-color-red-6, #fa5252);
+	background: var(--mantine-color-red-9, rgba(250, 82, 82, 0.12));
 }
 
 .nt-empty {

@@ -154,6 +154,20 @@ export function createHostApi(rpc, options = {}) {
 		return data && Array.isArray(data.items) ? data.items : [];
 	}
 
+	/**
+	 * Read a narrator's recent messages (role + text only, newest first).
+	 * Requires the `query.read.narrators` grant (same as listNarrators).
+	 * Returns [{ id, role, text, createdAt }].
+	 */
+	async function listMessages(narratorId, limit = 10) {
+		const result = await executeQuery("narrafork.narrator.messages.list", {
+			narratorId,
+			limit,
+		});
+		const data = result && typeof result === "object" ? result.data : undefined;
+		return data && Array.isArray(data.items) ? data.items : [];
+	}
+
 	/** Send a message to a narrator. Returns { accepted, messageId } on success. */
 	async function sendMessage(narratorId, message, options = {}) {
 		const input = { narratorId, message };
@@ -235,9 +249,51 @@ export function createHostApi(rpc, options = {}) {
 		return result && typeof result === "object" ? result.data ?? result : result;
 	}
 
+	/**
+	 * Upsert or clear a plugin-managed team-SOP section inside a narrator's
+	 * spec://behavior_fence. The host merges the section (user fence content is
+	 * preserved) and periodically injects it at the fence cadence, so the SOP
+	 * stays visible to the worker even after long runs / context compacts.
+	 * Returns { updated, revisionId }.
+	 */
+	async function specBehaviorFenceUpdate(narratorId, text, mode) {
+		const result = await executeCommand("narrafork.narrator.spec_behavior_fence_update", {
+			narratorId,
+			mode,
+			...(text !== undefined && text !== null ? { text } : {}),
+		});
+		return result && typeof result === "object" ? result.data ?? result : result;
+	}
+
 	/** Interrupt a narrator. Returns { interrupted }. */
 	async function interruptNarrator(narratorId) {
 		const result = await executeCommand("narrafork.narrator.interrupt", { narratorId });
+		return result && typeof result === "object" ? result.data ?? result : result;
+	}
+
+	/**
+	 * Update a narrator's title / model / reasoning effort (at least one field).
+	 * model "__default__" follows the global default. Returns { updated: string[] }.
+	 */
+	async function updateNarratorProfile(narratorId, patch = {}) {
+		const input = { narratorId };
+		for (const key of ["title", "model", "reasoningEffort"]) {
+			if (patch[key] !== undefined && patch[key] !== null) input[key] = patch[key];
+		}
+		const result = await executeCommand("narrafork.narrator.update_profile", input);
+		return result && typeof result === "object" ? result.data ?? result : result;
+	}
+
+	/**
+	 * Write (or replace) a whitelisted Dynamic Spec file for a narrator
+	 * (uri: "tasks.json" | "index.md"). Returns { path, uri, revisionId }.
+	 */
+	async function specFileWrite(narratorId, uri, content) {
+		const result = await executeCommand("narrafork.narrator.spec_write", {
+			narratorId,
+			uri,
+			content,
+		});
 		return result && typeof result === "object" ? result.data ?? result : result;
 	}
 
@@ -249,12 +305,16 @@ export function createHostApi(rpc, options = {}) {
 		storageDelete,
 		storageList,
 		listNarrators,
+		listMessages,
 		sendMessage,
 		sendSubagentMessage,
 		createNarrator,
 		deleteNarrator,
 		specTasksGet,
 		specTaskAdd,
+		specBehaviorFenceUpdate,
 		interruptNarrator,
+		updateNarratorProfile,
+		specFileWrite,
 	};
 }

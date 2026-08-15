@@ -50,6 +50,12 @@
 		pickerSelected: [],
 		pickerLeader: null,
 		messageTarget: null,
+		// Member profile editor: { teamId, memberId, name } when open.
+		editTarget: null,
+		// Task deletion confirm: { team, task } when open. Uses an in-panel DOM
+		// modal because the plugin iframe runs sandbox="allow-scripts" only, and
+		// window.confirm() is silently rejected without allow-modals.
+		deleteTarget: null,
 	};
 
 	// The last successfully loaded view is persisted under the plugin's own
@@ -293,10 +299,49 @@
 			teams.push(team);
 		}
 		state.teams = teams;
+		// Collaboration visibility: attach each member's latest assistant reply
+		// (read directly from the host, same source as the backend status view)
+		// so the leader sees real progress without opening the chat page.
+		await attachRecentReplies(state.teams);
 		// Keep the edit form anchored to a stable team (prefer the first one).
 		if (!teams.some((team) => team.id === state.activeTeamId)) {
 			state.activeTeamId = teams[0]?.id ?? null;
 		}
+	}
+
+	/** Attach recentReply to every team member (best-effort; never blocks). */
+	async function attachRecentReplies(teams) {
+		for (const team of teams) {
+			team.replies = {};
+			const ids = new Set([...(team.leaderId ? [team.leaderId] : []), ...(team.members ?? [])]);
+			for (const id of ids) {
+				try {
+					const result = await request("queries.execute", {
+						queryId: "narrafork.narrator.messages.list",
+						input: { narratorId: id, limit: 10 },
+					});
+					const items =
+						result && typeof result === "object" && result.status === "succeeded"
+							? result.data?.items ?? []
+							: [];
+					const reply = summarizeReplies(items);
+					if (reply) team.replies[id] = reply;
+				} catch {
+					// a message read failure must not block the panel
+				}
+			}
+		}
+	}
+
+	/** Newest assistant text from a message list (mirrors the backend helper). */
+	function summarizeReplies(messages) {
+		for (const item of messages ?? []) {
+			if (item && item.role === "assistant" && typeof item.text === "string" && item.text.trim()) {
+				const text = item.text.trim();
+				return text.length > 300 ? `${text.slice(0, 300)}…` : text;
+			}
+		}
+		return null;
 	}
 
 	/** Persist the current view for an instant first paint next time (throttled). */
@@ -696,13 +741,25 @@
 						style: `background: var(--mantine-color-${accent.color}-${accent.shade})`,
 						text: STATUS_LABEL[status] ?? status,
 					}),
-					el("span", { class: "nt-chip-main" }, [
-						el("span", { class: "nt-chip-title", text: label }),
-						el("span", {
-							class: "nt-chip-meta",
-							text: `${narrator.model ?? "default model"} · ${narrator.messageCount ?? 0} msgs · 最近 ${timeAgo(narrator.lastMessageAt)}`,
-						}),
-					]),
+				el("span", { class: "nt-chip-main" }, [
+					el("span", { class: "nt-chip-title", text: label }),
+					el("span", {
+						class: "nt-chip-meta",
+						text: `${narrator.model ?? "default model"} · ${narrator.messageCount ?? 0} msgs · 最近 ${timeAgo(narrator.lastMessageAt)}`,
+					}),
+					// Collaboration visibility: the member's latest reply, shown
+					// inline so the leader sees real progress without opening the
+					// chat page. `team.replies[id]` is filled by attachRecentReplies.
+					...(team.replies && typeof team.replies[id] === "string" && team.replies[id]
+						? [
+								el("span", {
+									class: "nt-chip-reply",
+									title: "最近回复",
+									text: `↳ ${team.replies[id]}`,
+								}),
+							]
+						: []),
+				]),
 				]),
 				el("span", { class: `nt-chip-role${isLeader ? " nt-chip-role-leader" : ""}`, text: role }),
 				// Interrupt a working member (host command.narrator.interrupt).
@@ -720,6 +777,20 @@
 						render();
 					},
 				}, "✉"),
+				// Edit the member's profile (title / model / reasoning effort).
+				// Visible for the leader (any member) or the recruiter of a temp.
+				...(canEditMember(team, id)
+					? [
+							el("button", {
+								class: "nt-chip-icon",
+								title: `编辑 ${label} 的资料`,
+								onclick: () => {
+									state.editTarget = { teamId: team.id, memberId: id, name: label };
+									render();
+								},
+							}, "✎"),
+						]
+					: []),
 				// Jump to the member's chat page.
 				el("button", {
 					class: "nt-chip-icon",
@@ -731,9 +802,212 @@
 		return el("div", { class: "nt-cards" }, chips);
 	}
 
+	/**
+	 * Whether the current narrator may edit a member's profile: the team leader
+	 * can edit anyone; a non-leader member may only edit temp workers they
+	 * recruited (mirrors the backend team.update_member authorization).
+	 */
+	function canEditMember(team, memberId) {
+		const current = state.currentNarratorId;
+		if (!current) return false;
+		if (team.leaderId === current) return true;
+		const role = team.memberRoles && team.memberRoles[memberId] === "temp" ? "temp" : "member";
+		return role === "temp" && team.recruitedBy && team.recruitedBy[memberId] === current;
+	}
+
+	function closeEditMember() {
+		state.editTarget = null;
+		render();
+	}
+
+	/** Save a member's profile through the host update_profile command. */
+	async function saveMemberProfile(teamId, memberId, patch) {
+		state.busy = true;
+		try {
+			const result = await request("commands.execute", {
+				commandId: "narrafork.narrator.update_profile",
+				input: { narratorId: memberId, ...patch },
+			});
+			if (result && typeof result === "object" && result.status === "failed") {
+				throw new Error(result.error?.message ?? "update failed");
+			}
+			state.notice = "成员资料已保存";
+			state.editTarget = null;
+		} catch (error) {
+			state.notice = `保存失败：${error instanceof Error ? error.message : String(error)}`;
+		} finally {
+			state.busy = false;
+			await refresh();
+		}
+	}
+
+	function renderEditMemberModal() {
+		const target = state.editTarget;
+		if (!target) return null;
+		const narrator =
+			state.narrators.find((n) => n.id === target.memberId) ??
+			{ id: target.memberId, title: target.name, model: null, reasoningEffort: null };
+		const titleInput = el("input", {
+			type: "text",
+			value: narrator.title ?? "",
+			placeholder: "名称（留空则不改）",
+			maxlength: 200,
+		});
+		const modelInput = el("input", {
+			type: "text",
+			value: narrator.model ?? "",
+			placeholder: "模型，如 claude-sonnet-4.5；__default__ 跟随全局",
+			maxlength: 200,
+		});
+		const effortSelect = el("select", {});
+		effortSelect.appendChild(el("option", { value: "", text: "（不改思考强度）" }));
+		for (const effort of ["none", "low", "medium", "high", "xhigh", "max"]) {
+			const option = el("option", { value: effort, text: effort });
+			if (narrator.reasoningEffort === effort) option.selected = true;
+			effortSelect.appendChild(option);
+		}
+		effortSelect.appendChild(el("option", { value: "__reset__", text: "重置为默认（null）" }));
+
+		const save = el("button", {
+			class: "nt-btn",
+			text: "保存",
+			onclick: async () => {
+				save.disabled = true;
+				const patch = {};
+				const title = titleInput.value.trim();
+				if (title && title !== narrator.title) patch.title = title;
+				const model = modelInput.value.trim();
+				if (model && model !== narrator.model) patch.model = model;
+				const effort = effortSelect.value;
+				if (effort === "__reset__") patch.reasoningEffort = null;
+				else if (effort && effort !== narrator.reasoningEffort) patch.reasoningEffort = effort;
+				if (Object.keys(patch).length === 0) {
+					state.notice = "没有需要保存的修改";
+					state.editTarget = null;
+					render();
+					return;
+				}
+				await saveMemberProfile(target.teamId, target.memberId, patch);
+			},
+		});
+
+		return el("div", {
+			class: "nt-modal-overlay",
+			onclick: (e) => { if (e.target === e.currentTarget) closeEditMember(); },
+		}, [
+			el("div", { class: "nt-modal nt-modal-narrow" }, [
+				el("div", { class: "nt-modal-header" }, [
+					el("h3", { text: `编辑成员：${target.name}` }),
+					el("button", { class: "nt-modal-close", text: "✕", onclick: closeEditMember }),
+				]),
+				el("div", { class: "nt-form" }, [
+					el("label", { text: "名称" }), titleInput,
+					el("label", { text: "模型" }), modelInput,
+					el("label", { text: "思考强度" }), effortSelect,
+					el("span", { class: "nt-empty", text: "仅填写需要修改的字段；保存后自动生效" }),
+				]),
+				el("div", { class: "nt-modal-footer" }, [
+					el("button", { class: "nt-btn nt-btn-outline", text: "取消", onclick: closeEditMember }),
+					save,
+				]),
+			]),
+		]);
+	}
+
+	/**
+	 * Confirm then delete a task from the team queue. Deletes the stored task
+	 * record AND removes it from the task index (persisted — "自动保存").
+	 */
+	async function deleteTask(teamId, seq) {
+		const key = teamTaskKey(teamId, seq);
+		const indexKey = teamTasksIndexKey(teamId);
+		try {
+			// 1) Remove the task record.
+			await request("storage.delete", { scope: { type: "global" }, key });
+			// 2) Remove its id from the index and persist the updated index.
+			const index = await storageGet(indexKey);
+			if (index && Array.isArray(index.ids)) {
+				const taskId = `task-${seq}`;
+				const ids = index.ids.filter((id) => id !== taskId);
+				await request("storage.set", {
+					scope: { type: "global" },
+					key: indexKey,
+					value: { ...index, ids },
+				});
+			}
+			state.notice = `已删除任务 #${seq}`;
+			// Update in-memory state so the panel reflects the deletion instantly.
+			const team = state.teams.find((t) => t.id === teamId);
+			if (team && Array.isArray(team.tasks)) {
+				team.tasks = team.tasks.filter((task) => task.seq !== seq);
+			}
+		} catch (error) {
+			state.notice = `删除任务失败：${error instanceof Error ? error.message : String(error)}`;
+		}
+		render();
+		saveViewCache();
+	}
+
+	function confirmDeleteTask(team, task) {
+		// Native confirm() is blocked inside the sandboxed iframe
+		// (sandbox="allow-scripts" without allow-modals): the browser silently
+		// rejects it and returns false, so the delete would never run. Use an
+		// in-panel DOM confirm modal instead — works regardless of sandbox flags.
+		state.deleteTarget = { team, task };
+		render();
+	}
+
+	function closeDeleteConfirm() {
+		state.deleteTarget = null;
+		render();
+	}
+
+	function renderDeleteConfirmModal() {
+		const target = state.deleteTarget;
+		if (!target) return null;
+		const { team, task } = target;
+		const del = el("button", {
+			class: "nt-btn nt-btn-danger",
+			text: "删除",
+			onclick: async () => {
+				del.disabled = true;
+				state.deleteTarget = null;
+				await deleteTask(team.id, task.seq);
+			},
+		});
+		return el("div", {
+			class: "nt-modal-overlay",
+			onclick: (e) => { if (e.target === e.currentTarget) closeDeleteConfirm(); },
+		}, [
+			el("div", { class: "nt-modal nt-modal-narrow" }, [
+				el("div", { class: "nt-modal-header" }, [
+					el("h3", { text: "删除任务" }),
+					el("button", { class: "nt-modal-close", text: "✕", onclick: closeDeleteConfirm }),
+				]),
+				el("div", { class: "nt-modal-list" }, [
+					el("p", { text: `确定删除任务 #${task.seq}（${task.memberId}）？删除后不可恢复。` }),
+				]),
+				el("div", { class: "nt-modal-footer" }, [
+					el("button", { class: "nt-btn nt-btn-outline", text: "取消", onclick: closeDeleteConfirm }),
+					del,
+				]),
+			]),
+		]);
+	}
+
 	function renderTasks(team) {
-		const rows = (team.tasks ?? []).map((task) =>
-			el("div", { class: "nt-task" }, [
+		const rows = (team.tasks ?? []).map((task) => {
+			const seq = task.seq;
+			const deleteBtn = el("button", {
+				class: "nt-task-delete",
+				title: "删除此任务",
+				text: "✕",
+				onclick: (e) => {
+					e.stopPropagation();
+					confirmDeleteTask(team, task);
+				},
+			});
+			const row = el("div", { class: "nt-task" }, [
 				el("span", { class: "nt-task-id", text: `#${task.seq} ${task.id}` }),
 				el("span", {
 					class: `nt-badge nt-badge-${task.status ?? "queued"}`,
@@ -742,8 +1016,15 @@
 				el("span", { class: "nt-task-member", text: task.memberId }),
 				el("div", { class: "nt-task-prompt", text: task.prompt }),
 				...(task.error ? [el("div", { class: "nt-task-error", text: task.error })] : []),
-			]),
-		);
+				deleteBtn,
+			]);
+			// Right-click anywhere on the row offers the same delete action.
+			row.addEventListener("contextmenu", (e) => {
+				e.preventDefault();
+				confirmDeleteTask(team, task);
+			});
+			return row;
+		});
 		return section(
 			"任务队列",
 			rows.length ? el("div", { class: "nt-tasks" }, rows) : el("p", { class: "nt-empty", text: "暂无任务" }),
@@ -968,6 +1249,10 @@
 		if (picker) root.appendChild(picker);
 		const messageModal = renderMessageModal();
 		if (messageModal) root.appendChild(messageModal);
+		const editModal = renderEditMemberModal();
+		if (editModal) root.appendChild(editModal);
+		const deleteModal = renderDeleteConfirmModal();
+		if (deleteModal) root.appendChild(deleteModal);
 	}
 
 	// ------------------------------------------------------------------ boot

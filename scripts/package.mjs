@@ -33,12 +33,12 @@ async function loadArchiver() {
 }
 
 const ROOT = resolve(import.meta.dir, "..");
-const VERSION = "0.1.37";
+const VERSION = "0.1.43";
 
 const files = [];
 (function walk(dir) {
 	for (const name of readdirSync(dir)) {
-		if (name === "tests" || name === "scripts") continue;
+		if (name === "tests" || name === "scripts" || name === ".git") continue;
 		const absolute = join(dir, name);
 		const relative = absolute.slice(ROOT.length + 1).replaceAll("\\", "/");
 		if (statSync(absolute).isDirectory()) {
