@@ -48,7 +48,7 @@
 		notice: null,
 		pickerOpen: false,
 		pickerSelected: [],
-		pickerLeader: null,
+		pickerLeaders: [],
 		messageTarget: null,
 		// Member profile editor: { teamId, memberId, name } when open.
 		editTarget: null,
@@ -86,8 +86,23 @@
 	}
 
 	async function storageList(prefix) {
-		const result = 			await request("storage.list", { scope: { type: "global" }, prefix });
-		return result && typeof result === "object" && Array.isArray(result.items) ? result.items : [];
+		const items = [];
+		let cursor;
+		const maxPages = 1_000;
+		for (let page = 0; page < maxPages; page += 1) {
+			const params = { scope: { type: "global" }, prefix, limit: 100 };
+			if (cursor) params.cursor = cursor;
+			const result = await request("storage.list", params);
+			if (result && typeof result === "object" && Array.isArray(result.items)) {
+				items.push(...result.items);
+			}
+			if (!result || result.hasMore !== true || typeof result.nextCursor !== "string" || !result.nextCursor) {
+				break;
+			}
+			if (result.nextCursor === cursor) break;
+			cursor = result.nextCursor;
+		}
+		return items;
 	}
 
 	function el(tag, props = {}, children = []) {
@@ -131,14 +146,25 @@
 
 	function narratorInTeam(team, narratorId) {
 		if (!team || !narratorId) return false;
-		return team.leaderId === narratorId || (Array.isArray(team.members) && team.members.includes(narratorId));
+		const leaderIds = Array.isArray(team.leaderIds)
+			? team.leaderIds
+			: team.leaderId
+				? [team.leaderId]
+				: [];
+		return leaderIds.includes(narratorId) || (Array.isArray(team.members) && team.members.includes(narratorId));
 	}
 
 	function parseTeam(raw, teamId) {
 		if (typeof raw !== "object" || raw === null) {
-			return { id: teamId, name: "", leaderId: null, members: [], memberRoles: {}, createdAt: null, updatedAt: null };
+			return { id: teamId, name: "", leaderIds: [], leaderId: null, members: [], memberRoles: {}, createdAt: null, updatedAt: null };
 		}
 		const members = Array.isArray(raw.members) ? raw.members.filter((m) => typeof m === "string") : [];
+		const leaderSource = Array.isArray(raw.leaderIds)
+			? raw.leaderIds
+			: typeof raw.leaderId === "string"
+				? [raw.leaderId]
+				: [];
+		const leaderIds = [...new Set(leaderSource)].filter((id) => typeof id === "string" && id.length > 0);
 		const memberRoles = {};
 		if (raw.memberRoles && typeof raw.memberRoles === "object") {
 			for (const [id, role] of Object.entries(raw.memberRoles)) {
@@ -148,7 +174,8 @@
 		return {
 			id: typeof raw.id === "string" && raw.id ? raw.id : teamId,
 			name: typeof raw.name === "string" ? raw.name : "",
-			leaderId: typeof raw.leaderId === "string" ? raw.leaderId : null,
+			leaderIds,
+			leaderId: leaderIds[0] ?? null,
 			members,
 			memberRoles,
 			createdAt: typeof raw.createdAt === "string" ? raw.createdAt : null,
@@ -242,10 +269,17 @@
 		if (entries.length > 0) return; // already migrated
 		const legacy = await storageGet("team.config");
 		if (legacy === null || legacy === undefined) return; // nothing to migrate
+		const leaderSource = Array.isArray(legacy.leaderIds)
+			? legacy.leaderIds
+			: typeof legacy.leaderId === "string"
+				? [legacy.leaderId]
+				: [];
+		const leaderIds = [...new Set(leaderSource)].filter((id) => typeof id === "string" && id.length > 0);
 		const team = {
 			id: "default",
 			name: typeof legacy.name === "string" ? legacy.name : "",
-			leaderId: typeof legacy.leaderId === "string" ? legacy.leaderId : null,
+			leaderIds,
+			leaderId: leaderIds[0] ?? null,
 			members: Array.isArray(legacy.members)
 				? legacy.members.filter((member) => typeof member === "string")
 				: [],
@@ -313,7 +347,7 @@
 	async function attachRecentReplies(teams) {
 		for (const team of teams) {
 			team.replies = {};
-			const ids = new Set([...(team.leaderId ? [team.leaderId] : []), ...(team.members ?? [])]);
+			const ids = new Set([...(team.leaderIds ?? (team.leaderId ? [team.leaderId] : [])), ...(team.members ?? [])]);
 			for (const id of ids) {
 				try {
 					const result = await request("queries.execute", {
@@ -440,7 +474,7 @@
 	function teamMemberIds() {
 		const ids = new Set();
 		for (const team of state.teams) {
-			if (team.leaderId) ids.add(team.leaderId);
+			for (const leaderId of team.leaderIds ?? (team.leaderId ? [team.leaderId] : [])) ids.add(leaderId);
 			for (const member of team.members) ids.add(member);
 		}
 		return [...ids];
@@ -528,15 +562,17 @@
 		return state.teams.find((team) => team.id === state.activeTeamId) ?? null;
 	}
 
-	async function saveTeamConfig(name, leaderId, members) {
+	async function saveTeamConfig(name, leaderIds, members) {
 		const team = activeTeam();
 		if (!team) return;
 		state.busy = true;
 		try {
+			const normalizedLeaderIds = [...new Set(Array.isArray(leaderIds) ? leaderIds : [])].filter(Boolean);
 			const next = {
 				...team,
 				name,
-				leaderId: leaderId || null,
+				leaderIds: normalizedLeaderIds,
+				leaderId: normalizedLeaderIds[0] ?? null,
 				members,
 				updatedAt: new Date().toISOString(),
 			};
@@ -687,35 +723,41 @@
 			oninput: (e) => scheduleAutoSave({ name: e.target.value.trim() }),
 		});
 		const leaderSelect = el("select", {
-			onchange: (e) => scheduleAutoSave({ leaderId: e.target.value || null }),
+			multiple: "multiple",
+			size: Math.min(Math.max(state.narrators.length, 3), 8),
+			onchange: (e) =>
+				scheduleAutoSave({
+					leaderIds: Array.from(e.target.selectedOptions, (option) => option.value),
+				}),
 		});
-		leaderSelect.appendChild(el("option", { value: "", text: "（无 Leader）" }));
+		const leaderIds = team.leaderIds ?? (team.leaderId ? [team.leaderId] : []);
 		for (const narrator of state.narrators) {
 			const option = el("option", {
 				value: narrator.id,
 				text: `${narratorLabel(narrator)}（${narrator.id}）`,
 			});
-			if (narrator.id === team.leaderId) option.selected = true;
+			if (leaderIds.includes(narrator.id)) option.selected = true;
 			leaderSelect.appendChild(option);
 		}
 
 		return section("团队配置", el("div", { class: "nt-form" }, [
 			el("label", { text: "名称" }), nameInput,
-			el("label", { text: "Leader" }), leaderSelect,
-			el("span", { class: "nt-empty", text: "名称与 Leader 修改后自动保存" }),
+			el("label", { text: "Leaders（可多选）" }), leaderSelect,
+			el("span", { class: "nt-empty", text: "名称与 Leader 修改后自动保存；按 Ctrl/Cmd 可多选" }),
 		]));
 	}
 
 	function renderMemberChips(team) {
 		const byId = new Map(state.narrators.map((narrator) => [narrator.id, narrator]));
+		const leaderIds = team.leaderIds ?? (team.leaderId ? [team.leaderId] : []);
 		const ids = [
-			...(team.leaderId ? [team.leaderId] : []),
-			...team.members.filter((id) => id !== team.leaderId),
+			...leaderIds,
+			...team.members.filter((id) => !leaderIds.includes(id)),
 		];
 		if (ids.length === 0) return el("p", { class: "nt-empty", text: "尚未配置成员" });
 		const chips = ids.map((id) => {
 			const narrator = byId.get(id) ?? { id, status: "missing" };
-			const isLeader = id === team.leaderId;
+			const isLeader = leaderIds.includes(id);
 			// The primary accent marks the CURRENT narrator (whose chat page the
 			// panel is attached to); the leader is only identified by its pill.
 			const isCurrent = id === state.currentNarratorId;
@@ -810,7 +852,8 @@
 	function canEditMember(team, memberId) {
 		const current = state.currentNarratorId;
 		if (!current) return false;
-		if (team.leaderId === current) return true;
+		const leaderIds = team.leaderIds ?? (team.leaderId ? [team.leaderId] : []);
+		if (leaderIds.includes(current)) return true;
 		const role = team.memberRoles && team.memberRoles[memberId] === "temp" ? "temp" : "member";
 		return role === "temp" && team.recruitedBy && team.recruitedBy[memberId] === current;
 	}
@@ -1048,7 +1091,7 @@
 		if (!team) return;
 		state.pickerOpen = true;
 		state.pickerSelected = [];
-		state.pickerLeader = team.leaderId;
+		state.pickerLeaders = [...(team.leaderIds ?? (team.leaderId ? [team.leaderId] : []))];
 		render();
 	}
 
@@ -1067,30 +1110,28 @@
 	async function confirmPicker() {
 		const team = activeTeam();
 		if (!team) return;
-		const members = Array.from(new Set([...team.members, ...state.pickerSelected]));
-		// Leader 必须同时是成员：单独设为 Leader 时自动加入
-		let leaderId = state.pickerLeader;
-		if (leaderId && !members.includes(leaderId)) members.push(leaderId);
+		const members = Array.from(new Set([...team.members, ...state.pickerSelected, ...state.pickerLeaders]));
+		// Every Leader must also be a member.
 		state.pickerOpen = false;
-		await saveTeamConfig(team.name, leaderId, members);
+		await saveTeamConfig(team.name, state.pickerLeaders, members);
 	}
 
-	/** 移除成员；若移除的是 Leader 则同步清空 Leader。 */
+	/** Remove a member; removing a Leader also clears that Leader assignment. */
 	async function deleteMember(id) {
 		const team = activeTeam();
 		if (!team) return;
 		const members = team.members.filter((member) => member !== id);
-		const leaderId = team.leaderId === id ? null : team.leaderId;
-		await saveTeamConfig(team.name, leaderId, members);
+		const leaderIds = (team.leaderIds ?? (team.leaderId ? [team.leaderId] : [])).filter((leaderId) => leaderId !== id);
+		await saveTeamConfig(team.name, leaderIds, members);
 	}
 
-	/** 弹窗内切换 Leader（单选；再点一次取消）。 */
+	/** Toggle a Leader in the multi-select picker. */
 	function toggleLeader(id) {
-		state.pickerLeader = state.pickerLeader === id ? null : id;
-		// Leader 一定是成员：自动纳入勾选
-		if (state.pickerLeader && !state.pickerSelected.includes(id)) {
-			state.pickerSelected.push(id);
-		}
+		const idx = state.pickerLeaders.indexOf(id);
+		if (idx >= 0) state.pickerLeaders.splice(idx, 1);
+		else state.pickerLeaders.push(id);
+		// Every Leader is also a member: auto-select it in the picker.
+		if (!state.pickerSelected.includes(id)) state.pickerSelected.push(id);
 		render();
 	}
 
@@ -1108,8 +1149,9 @@
 		if (!state.pickerOpen) return null;
 		const team = activeTeam();
 		if (!team) return null;
+		const leaderIds = team.leaderIds ?? (team.leaderId ? [team.leaderId] : []);
 		const rows = state.narrators.map((narrator) => {
-			const alreadyMember = team.members.includes(narrator.id) || narrator.id === team.leaderId;
+			const alreadyMember = team.members.includes(narrator.id) || leaderIds.includes(narrator.id);
 			const selected = state.pickerSelected.includes(narrator.id);
 			const status = narrator.status ?? "idle";
 			const accent = PICKER_STATUS[status] ?? PICKER_STATUS.idle;
@@ -1126,7 +1168,7 @@
 					el("div", { class: "nt-narrator-sub", text: `${narrator.id} · ${narrator.model ?? "default model"} · ${narrator.messageCount ?? 0} msgs` }),
 				]),
 				el("button", {
-					class: `nt-leader-mark${state.pickerLeader === narrator.id ? " nt-leader-active" : ""}`,
+					class: `nt-leader-mark${state.pickerLeaders.includes(narrator.id) ? " nt-leader-active" : ""}`,
 					text: "★",
 					title: "设为 Leader",
 					onclick: (e) => { e.stopPropagation(); toggleLeader(narrator.id); },

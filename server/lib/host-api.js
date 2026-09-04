@@ -105,13 +105,13 @@ export function createHostApi(rpc, options = {}) {
 		}
 	}
 
-	async function storageList(prefix) {
+	async function storageList(prefix, options = {}) {
 		try {
-			return await rpc.request(
-				"storage.list",
-				{ scope: OWN_SCOPE, ...(prefix === undefined ? {} : { prefix }) },
-				{ timeoutMs },
-			);
+			const params = { scope: OWN_SCOPE };
+			if (prefix !== undefined) params.prefix = prefix;
+			if (typeof options.cursor === "string" && options.cursor) params.cursor = options.cursor;
+			if (Number.isInteger(options.limit) && options.limit > 0) params.limit = options.limit;
+			return await rpc.request("storage.list", params, { timeoutMs });
 		} catch (error) {
 			throw toHostError(error);
 		}
@@ -209,6 +209,7 @@ export function createHostApi(rpc, options = {}) {
 			"cwd",
 			"chapterId",
 			"permissionMode",
+			"planReflectionAutoApproveOverride",
 			"type",
 			"subagentType",
 			"parentNarratorId",
@@ -271,13 +272,27 @@ export function createHostApi(rpc, options = {}) {
 		return result && typeof result === "object" ? result.data ?? result : result;
 	}
 
+	/** Deliver a structured shared context record to multiple narrators. */
+	async function deliverNarratorContext(input, options = {}) {
+		const result = await executeCommand("narrafork.narrator.context.broadcast", input, {
+			idempotencyKey: options.idempotencyKey ?? input?.contextId,
+		});
+		return result && typeof result === "object" ? result.data ?? result : result;
+	}
+
+	/** Read delivery receipts for one context record. */
+	async function getNarratorContextDeliveries(input) {
+		const result = await executeQuery("narrafork.narrator.context.deliveries.list", input);
+		return result && typeof result === "object" ? result.data ?? result : result;
+	}
+
 	/**
 	 * Update a narrator's title / model / reasoning effort (at least one field).
 	 * model "__default__" follows the global default. Returns { updated: string[] }.
 	 */
 	async function updateNarratorProfile(narratorId, patch = {}) {
 		const input = { narratorId };
-		for (const key of ["title", "model", "reasoningEffort"]) {
+		for (const key of ["title", "model", "reasoningEffort", "planReflectionAutoApproveOverride"]) {
 			if (patch[key] !== undefined && patch[key] !== null) input[key] = patch[key];
 		}
 		const result = await executeCommand("narrafork.narrator.update_profile", input);
@@ -316,5 +331,7 @@ export function createHostApi(rpc, options = {}) {
 		interruptNarrator,
 		updateNarratorProfile,
 		specFileWrite,
+		deliverNarratorContext,
+		getNarratorContextDeliveries,
 	};
 }

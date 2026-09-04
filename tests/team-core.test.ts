@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import * as core from "../server/lib/team-core.js";
+import { TEMP_SOP, TEAM_TASK_MARKER, WORKER_SOP } from "../server/lib/team-sop.js";
 
 const NOW = "2026-08-08T12:00:00.000Z";
 
@@ -7,6 +8,7 @@ describe("team config", () => {
 	test("defaults to an empty team", () => {
 		expect(core.defaultTeamConfig()).toEqual({
 			name: "",
+			leaderIds: [],
 			leaderId: null,
 			members: [],
 			memberRoles: {},
@@ -27,6 +29,7 @@ describe("team config", () => {
 			}),
 		).toEqual({
 			name: "",
+			leaderIds: ["n1"],
 			leaderId: "n1",
 			members: ["n2", "n3"],
 			memberRoles: {},
@@ -40,12 +43,31 @@ describe("team config", () => {
 		const next = core.applyTeamConfigPatch(current, { members: ["n3", "n4", "n3"] }, NOW);
 		expect(next).toEqual({
 			name: "A",
+			leaderIds: ["n1"],
 			leaderId: "n1",
-			members: ["n3", "n4"],
+			members: ["n1", "n3", "n4"],
 			memberRoles: {},
 			recruitedBy: {},
 			updatedAt: NOW,
 		});
+	});
+
+	test("supports canonical multi-Leader config while preserving legacy leaderId", () => {
+		const parsed = core.parseTeamConfig({
+			leaderIds: ["n1", "n2", "n1"],
+			leaderId: "stale-legacy-leader",
+			members: ["n3"],
+		});
+		expect(parsed.leaderIds).toEqual(["n1", "n2"]);
+		expect(parsed.leaderId).toBe("n1");
+
+		const next = core.applyTeamConfigPatch(parsed, { leaderIds: ["n2", "n4"] }, NOW);
+		expect(next.leaderIds).toEqual(["n2", "n4"]);
+		expect(next.leaderId).toBe("n2");
+		expect(next.members).toEqual(["n4", "n2", "n3"]);
+		expect(core.isTeamLeader(next, "n2")).toBe(true);
+		expect(core.isTeamLeader(next, "n4")).toBe(true);
+		expect(core.isTeamLeader(next, "n1")).toBe(false);
 	});
 
 	test("validateTeamConfig rejects unknown narrators and empty teams", () => {
@@ -390,6 +412,16 @@ describe("planDispatch", () => {
 		}
 	});
 
+	test("rejects every configured Leader as a dispatch target", () => {
+		const multiLeader = core.parseTeamConfig({ leaderIds: ["n1", "n2"], members: ["n1", "n2", "n3"] });
+		expect(
+			core.planDispatch(multiLeader, { memberId: "n2", task: "x" }, { now: NOW, taskId: "t", index }).ok,
+		).toBe(false);
+		expect(
+			core.planDispatch(multiLeader, { memberId: "n3", task: "x" }, { now: NOW, taskId: "t", index }).ok,
+		).toBe(true);
+	});
+
 	test("rejects non-members, empty prompts and the leader itself", () => {
 		expect(
 			core.planDispatch(config, { memberId: "nX", task: "x" }, { now: NOW, taskId: "t", index }).ok,
@@ -437,6 +469,20 @@ describe("buildStatusView", () => {
 		expect(view.queue[0]).toMatchObject({ status: "sent", memberId: "n2" });
 	});
 
+	test("exposes all Leaders while retaining the legacy first leader field", () => {
+		const config = core.parseTeamConfig({ leaderIds: ["n1", "n2"], members: ["n1", "n2", "n3"] });
+		const view = core.buildStatusView(
+			config,
+			{
+				narrators: [{ id: "n1", title: "One" }, { id: "n2", title: "Two" }],
+				tasks: [],
+			},
+		);
+		expect(view.leaderIds).toEqual(["n1", "n2"]);
+		expect(view.leaders.map((leader) => leader.id)).toEqual(["n1", "n2"]);
+		expect(view.leader.id).toBe("n1");
+	});
+
 	test("marks unknown narrators as missing", () => {
 		const config = core.parseTeamConfig({ name: "T", leaderId: null, members: ["nX"] });
 		const view = core.buildStatusView(config, { narrators: [], tasks: [] });
@@ -449,6 +495,7 @@ describe("multi-team model", () => {
 		expect(core.defaultTeam("team-a", NOW)).toEqual({
 			id: "team-a",
 			name: "",
+			leaderIds: [],
 			leaderId: null,
 			members: [],
 			memberRoles: {},
@@ -476,6 +523,7 @@ describe("multi-team model", () => {
 		expect(parsed).toEqual({
 			id: "team-x",
 			name: "",
+			leaderIds: ["n1"],
 			leaderId: "n1",
 			members: ["n2", "n3"],
 			memberRoles: {},
@@ -498,8 +546,9 @@ describe("multi-team model", () => {
 		expect(next).toEqual({
 			id: "team-x",
 			name: "A",
+			leaderIds: ["n1"],
 			leaderId: "n1",
-			members: ["n3", "n4"],
+			members: ["n1", "n3", "n4"],
 			memberRoles: {},
 			recruitedBy: {},
 			createdAt: NOW,
@@ -669,6 +718,55 @@ describe("collaboration visibility & follow-up", () => {
 		expect(core.promptMentionsPath("src/unrelated.ts", "fix the worker")).toBe(false);
 		expect(core.promptMentionsPath("", "anything")).toBe(false);
 		expect(core.promptMentionsPath("a.ts", null)).toBe(false);
+	});
+});
+
+describe("team task source SOP", () => {
+	test("requires the stable marker and rejects unconditional reporting language", () => {
+		expect(TEAM_TASK_MARKER).toBe("[团队任务 ");
+		for (const sop of [WORKER_SOP, TEMP_SOP]) {
+			expect(sop).toContain("带有 [团队任务 task-N（high|normal）] 标记");
+			expect(sop).toContain("不要调用 team.report");
+			expect(sop).toContain("不要因为自己是团队成员");
+			expect(sop).toContain("team.context_broadcast");
+			expect(sop).toMatch(/实际负责修改的成员|实际实施者/);
+			expect(sop).toContain("不替代");
+			expect(sop).toContain("原始 tool 输出");
+			expect(sop).not.toContain("完成任务后必须调用 team.report");
+		}
+	});
+});
+
+describe("shared context log", () => {
+	test("normalizes context records and filters the shared log", () => {
+		const entry = core.parseContextEntry({
+			id: "ctx-1",
+			kind: "decision",
+			text: "  Use the batched delivery path  ",
+			payload: { accepted: true, nested: { nope: true } },
+			sourceNarratorId: "leader",
+			targetNarratorIds: ["worker", "worker"],
+			createdAt: NOW,
+		});
+		expect(entry).toEqual({
+			id: "ctx-1",
+			kind: "decision",
+			text: "Use the batched delivery path",
+			payload: { accepted: true },
+			sourceNarratorId: "leader",
+			targetNarratorIds: ["worker"],
+			createdAt: NOW,
+		});
+		expect(core.filterContextEntries([entry], { kind: "decision", contains: "BATCHED" })).toEqual([entry]);
+	});
+
+	test("appendContextIndex is idempotent and trims oldest ids", () => {
+		const first = core.appendContextIndex({ ids: ["ctx-1", "ctx-2"] }, "ctx-2");
+		expect(first).toEqual({ ids: ["ctx-2", "ctx-1"], trimmed: [] });
+		const ids = Array.from({ length: core.CONTEXT_LOG_LIMITS.maxEntries + 1 }, (_, i) => `ctx-${i}`);
+		const result = core.appendContextIndex({ ids: ids.slice(1) }, ids[0]);
+		expect(result.ids.length).toBe(core.CONTEXT_LOG_LIMITS.maxEntries);
+		expect(result.ids[0]).toBe(ids[0]);
 	});
 });
 

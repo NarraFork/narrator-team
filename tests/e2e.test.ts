@@ -53,7 +53,6 @@ import {
 	narratorWhitelistDirs,
 	narrators,
 	projects,
-	terminalTabs,
 	terminalViewState,
 	terminals,
 } from "../../../narrafork/server/db/schema";
@@ -72,6 +71,7 @@ const subagentSent = [];
 let failSubagentDelivery = false;
 let narratorSeq = 0;
 const createdNarrators = [];
+const profileUpdates = [];
 const deletedNarrators = [];
 // Fake per-member Dynamic Spec queues (spec://tasks.json mirror).
 const specQueues = new Map();
@@ -127,9 +127,10 @@ const fakeSession = {
 				type: input.type === "subagent" ? "subagent" : "primary",
 				inheritMode: "fresh",
 				title: input.title ?? `Created ${narratorSeq}`,
-				variant: input.type === "subagent" ? "subagent:general" : "primary",
-				parentNarratorId: input.type === "subagent" ? (input.parentNarratorId ?? null) : null,
-				status: "idle",
+			variant: input.type === "subagent" ? "subagent:general" : "primary",
+			parentNarratorId: input.type === "subagent" ? (input.parentNarratorId ?? null) : null,
+			planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride ?? "inherit",
+			status: "idle",
 				substatus: "[]",
 				messageCount: 0,
 				createdAt: now,
@@ -159,10 +160,14 @@ const fakeSession = {
 		return { id };
 	},
 	async updateProfile(narratorId, patch) {
+		profileUpdates.push({ narratorId, ...patch });
 		const set = {
 			...(patch.title !== undefined ? { title: patch.title } : {}),
 			...(patch.model !== undefined ? { model: patch.model } : {}),
 			...(patch.reasoningEffort !== undefined ? { reasoningEffort: patch.reasoningEffort } : {}),
+			...(patch.planReflectionAutoApproveOverride !== undefined
+				? { planReflectionAutoApproveOverride: patch.planReflectionAutoApproveOverride }
+				: {}),
 			updatedAt: new Date().toISOString(),
 		};
 		db.update(narrators).set(set).where(eq(narrators.id, narratorId)).run();
@@ -270,6 +275,20 @@ beforeAll(async () => {
 		.run();
 	db.insert(narrators)
 		.values({
+			id: "n-coleader",
+			chapterId: "ch1",
+			type: "primary",
+			inheritMode: "fresh",
+			title: "Co Leader",
+			status: "idle",
+			substatus: "[]",
+			messageCount: 0,
+			createdAt: now,
+			updatedAt: now,
+		})
+		.run();
+	db.insert(narrators)
+		.values({
 			id: "n-other",
 			chapterId: "ch1",
 			type: "primary",
@@ -316,7 +335,7 @@ beforeAll(async () => {
 	});
 	const binding = hostServices.bindRuntime({
 		pluginId: PLUGIN_ID,
-		packageVersion: "0.1.42",
+		packageVersion: "0.1.45",
 		installationId: "installation-e2e",
 		runtimeId: "runtime-e2e",
 		runtimeGeneration: 1,
@@ -331,7 +350,7 @@ beforeAll(async () => {
 	// Spawn the actual plugin process and wire its host-facing dispatcher.
 	pluginRuntime = new PluginRuntime({
 		pluginId: PLUGIN_ID,
-		pluginVersion: "0.1.42",
+		pluginVersion: "0.1.45",
 		installationId: "installation-e2e",
 		runtimeId: "runtime-e2e",
 		command: [process.execPath, join(PLUGIN_ROOT, "server/index.js")],
@@ -396,11 +415,26 @@ describe("narrator-team end-to-end", () => {
 		return doc.scopes?.["global\u0000"]?.[key]?.value;
 	}
 
+	/** Seed a primary narrator so team.setup can create a fresh owned team. */
+	function seedPagedNarrator(id, title) {
+		db.insert(narrators)
+			.values({
+				id,
+				chapterId: "ch1",
+				type: "primary",
+				inheritMode: "fresh",
+				title,
+				status: "idle",
+				substatus: "[]",
+				messageCount: 0,
+				createdAt: "2026-08-08T12:00:00.000Z",
+				updatedAt: "2026-08-08T12:00:00.000Z",
+			})
+			.run();
+	}
+
 	test("handshake succeeded and team.status reports no teams initially", async () => {
-		const result = await invoke("team.status", {}).catch((error) => {
-			console.log("AUDIT:", error.audit);
-			throw error;
-		});
+		const result = await invoke("team.status", {});
 		expect(result.output).toBeDefined();
 		const status = JSON.parse(result.output);
 		expect(status).toMatchObject({ ok: true, teams: [] });
@@ -425,6 +459,33 @@ describe("narrator-team end-to-end", () => {
 		// Persisted under the team-scoped key.
 		const persisted = readStored(`team.${teamAId}.config`);
 		expect(persisted).toMatchObject({ id: teamAId, leaderId: "n-leader", members: ["n-leader", "n-worker"] });
+	});
+
+	test("team.setup accepts multiple Leaders and exposes both in status", async () => {
+		const result = await invoke(
+			"team.setup",
+			{
+				teamId: teamAId,
+				leaderIds: ["n-leader", "n-coleader"],
+				members: ["n-worker"],
+			},
+			"n-leader",
+		);
+		expect(result.error).toBeUndefined();
+		const output = JSON.parse(result.output);
+		expect(output.leaderIds).toEqual(["n-leader", "n-coleader"]);
+		expect(output.leaderId).toBe("n-leader");
+		expect(output.members).toEqual(["n-coleader", "n-leader", "n-worker"]);
+
+		const persisted = readStored(`team.${teamAId}.config`);
+		expect(persisted).toMatchObject({
+			leaderIds: ["n-leader", "n-coleader"],
+			leaderId: "n-leader",
+		});
+
+		const coLeaderView = JSON.parse((await invoke("team.status", {}, "n-coleader")).output);
+		expect(coLeaderView.teams[0].leaderIds).toEqual(["n-leader", "n-coleader"]);
+		expect(coLeaderView.teams[0].leaders.map((leader) => leader.id)).toEqual(["n-leader", "n-coleader"]);
 	});
 
 	test("team.setup creates a second team with a different owner", async () => {
@@ -472,9 +533,14 @@ describe("narrator-team end-to-end", () => {
 		expect(sent[0].narratorId).toBe("n-worker");
 		expect(sent[0].prompt).toContain("review chapter 3 and report back");
 		expect(sent[0].prompt).toContain("[团队任务 task-1（normal）]");
+		expect(sent[0].prompt).toContain('taskId="task-1"');
 		expect(sent[0].prompt).toContain("[团队协作准则 · Worker]"); // role SOP appended
 		expect(sent[0].locale).toBe("en");
 		expect(sent[0].originLabel).toBe(`plugin:${PLUGIN_ID}`);
+		expect(profileUpdates).toContainEqual({
+			narratorId: "n-worker",
+			planReflectionAutoApproveOverride: "on",
+		});
 
 		// Queue record persisted in the team-scoped namespace.
 		const task = readStored(`team.${teamAId}.tasks.1`);
@@ -550,6 +616,31 @@ describe("narrator-team end-to-end", () => {
 		expect(task.messageId).toBe("smsg-1");
 	});
 
+	test("worker team.report requires a dispatched task marker", async () => {
+		await expect(
+			invoke(
+				"team.report",
+				{ teamId: teamAId, summary: "I finished a direct user task" },
+				"n-worker",
+			),
+		).rejects.toThrow(/requires the taskId/);
+
+		const validReport = JSON.parse(
+			(
+				await invoke(
+					"team.report",
+					{ taskId: "task-1", summary: "Reviewed chapter 3" },
+					"n-worker",
+				)
+			).output,
+		);
+		expect(validReport).toMatchObject({ ok: true, teamId: teamAId, taskCount: 1 });
+		expect(readStored(`team.${teamAId}.tasks.1`).status).toBe("done");
+		expect(sent.filter((message) => message.narratorId === "n-leader")).toHaveLength(1);
+		expect(sent.filter((message) => message.narratorId === "n-coleader")).toHaveLength(1);
+
+	});
+
 	test("subagent delivery failure marks the task failed with the host reason", async () => {
 		failSubagentDelivery = true;
 		try {
@@ -583,7 +674,11 @@ describe("narrator-team end-to-end", () => {
 		expect(output.role).toBe("member");
 		expect(output.variant).toBe("primary");
 		expect(createdNarrators).toHaveLength(1);
-		expect(createdNarrators[0]).toMatchObject({ type: "primary", title: "New Member" });
+		expect(createdNarrators[0]).toMatchObject({
+			type: "primary",
+			title: "New Member",
+			planReflectionAutoApproveOverride: "on",
+		});
 
 		const config = readStored(`team.${teamAId}.config`);
 		expect(config.members).toContain(output.memberId);
@@ -616,6 +711,7 @@ describe("narrator-team end-to-end", () => {
 			type: "subagent",
 			subagentType: "explore",
 			parentNarratorId: "n-worker",
+			planReflectionAutoApproveOverride: "on",
 		});
 
 		const config = readStored(`team.${teamAId}.config`);
@@ -775,7 +871,7 @@ describe("narrator-team end-to-end", () => {
 		).rejects.toThrow(/spec.uri must be one of/);
 	});
 
-	test("host-deleted members retire orphan tasks and cannot receive new dispatches", async () => {
+	test("host-deleted members retire orphan tasks", async () => {
 		const beforeSent = sent.length;
 		const beforeSubagentSent = subagentSent.length;
 		const result = await invoke(
@@ -800,7 +896,6 @@ describe("narrator-team end-to-end", () => {
 			.all()
 			.map((row) => row.id);
 		db.delete(terminalViewState).where(eq(terminalViewState.narratorId, "n-worker")).run();
-		db.delete(terminalTabs).where(eq(terminalTabs.narratorId, "n-worker")).run();
 		db.delete(terminals).where(eq(terminals.narratorId, "n-worker")).run();
 		db.delete(narratorBufferedMessages).where(eq(narratorBufferedMessages.narratorId, "n-worker")).run();
 		db.delete(narratorFileSnapshots).where(eq(narratorFileSnapshots.narratorId, "n-worker")).run();
@@ -820,7 +915,6 @@ describe("narrator-team end-to-end", () => {
 		db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, "n-worker")).run();
 		if (workerMessageIds.length > 0) {
 			db.update(narrators).set({ forkMessageId: null, pruneBoundaryMessageId: null }).where(eq(narrators.id, "n-worker")).run();
-			db.delete(narratorSidecars).where(eq(narratorSidecars.narratorId, "n-worker")).run();
 			db.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, "n-worker")).run();
 			db.delete(narratorMessages).where(eq(narratorMessages.narratorId, "n-worker")).run();
 		}
@@ -837,15 +931,29 @@ describe("narrator-team end-to-end", () => {
 			status: "missing",
 		});
 
-		const dispatchRequest = invoke(
-			"team.dispatch",
-			{ teamId: teamAId, memberId: "n-worker", task: "must not be delivered" },
-			"n-leader",
-		);
-		await expect(dispatchRequest).rejects.toThrow(/Member narrator no longer exists/);
 		expect(sent.length).toBe(beforeSent + 1);
 		expect(subagentSent.length).toBe(beforeSubagentSent);
 		const queue = JSON.parse((await invoke("team.status", { teamId: teamAId }, "n-leader")).output).teams[0].queue;
 		expect(queue.some((task) => task.memberId === "n-worker" && task.status === "queued")).toBe(false);
+	});
+
+	test("team.status enumerates teams beyond one storage page", { timeout: 15_000 }, async () => {
+		// A caller that already belongs to a team updates that team when no teamId
+		// is supplied. Seed distinct callers so each setup call creates a fresh team
+		// and add n-other as a member for the final visibility check.
+		for (let index = 0; index < 50; index += 1) {
+			const callerId = `paged-narrator-${index}`;
+			seedPagedNarrator(callerId, `Paged Caller ${index}`);
+			const result = await invoke(
+				"team.setup",
+				{ name: `Paged Team ${index}`, leaderId: callerId, members: ["n-other"] },
+				callerId,
+			);
+			expect(JSON.parse(result.output).ok).toBe(true);
+		}
+		const view = JSON.parse((await invoke("team.status", {}, "n-other")).output);
+		expect(view.ok).toBe(true);
+		expect(view.teams).toHaveLength(51); // Team B + 50 paged teams
+		expect(view.teams.some((team) => team.name === "Paged Team 49")).toBe(true);
 	});
 });

@@ -16,7 +16,7 @@ import { readFileSync } from "node:fs";
 import { createHostApi } from "./lib/host-api.js";
 import { createRpc } from "./lib/rpc.js";
 import * as core from "./lib/team-core.js";
-import { teamSopForRole } from "./lib/team-sop.js";
+import { TEAM_TASK_MARKER, teamSopForRole } from "./lib/team-sop.js";
 
 const PLUGIN_ID = "com.whisent.narrator-team";
 // 从包内 manifest.json 读取真实版本：hello 握手要求版本与安装版本一致，
@@ -41,6 +41,8 @@ const storageKeyTask = (taskId) => `tasks.${taskId}`;
 const teamConfigKey = (teamId) => `team.${teamId}.config`;
 const teamTasksIndexKey = (teamId) => `team.${teamId}.tasks.index`;
 const teamTaskKey = (teamId, seq) => `team.${teamId}.tasks.${seq}`;
+const teamContextIndexKey = (teamId) => `team.${teamId}.contexts.index`;
+const teamContextKey = (teamId, contextId) => `team.${teamId}.contexts.${encodeURIComponent(contextId)}`;
 const STATUS_QUEUE_WINDOW = 20;
 
 let initialized = false;
@@ -59,15 +61,27 @@ const host = createHostApi(rpc);
 // Persistence helpers (multi-team)
 // ---------------------------------------------------------------------------
 
-/** Enumerate team ids from the `team.<id>.config` keys. */
+/** Enumerate every team id from the paginated `team.<id>.config` keys. */
 async function listTeamIds() {
-	const result = await host.storageList(TEAM_PREFIX);
-	const items =
-		result && typeof result === "object" && Array.isArray(result.items) ? result.items : [];
-	const keys = items.map((entry) => (entry && typeof entry.key === "string" ? entry.key : null));
+	const keys = [];
+	let cursor;
+	const maxPages = 1_000;
+	for (let page = 0; page < maxPages; page += 1) {
+		const result = await host.storageList(TEAM_PREFIX, { cursor, limit: 100 });
+		const items =
+			result && typeof result === "object" && Array.isArray(result.items) ? result.items : [];
+		for (const entry of items) {
+			if (entry && typeof entry.key === "string") keys.push(entry.key);
+		}
+		if (!result || result.hasMore !== true || typeof result.nextCursor !== "string" || !result.nextCursor) {
+			break;
+		}
+		if (result.nextCursor === cursor) break;
+		cursor = result.nextCursor;
+	}
 	return [...new Set(
 		keys
-			.filter((key) => key && key.startsWith(TEAM_PREFIX) && key.endsWith(".config"))
+			.filter((key) => key.startsWith(TEAM_PREFIX) && key.endsWith(".config"))
 			.map((key) => key.slice(TEAM_PREFIX.length, -".config".length)),
 	)];
 }
@@ -97,6 +111,31 @@ async function readTeamTask(teamId, seq) {
 
 async function writeTeamTask(teamId, task) {
 	await host.storageSet(teamTaskKey(teamId, task.seq), task);
+}
+
+async function readContextIndex(teamId) {
+	return core.parseContextIndex(await host.storageGet(teamContextIndexKey(teamId)));
+}
+
+async function readContextEntry(teamId, contextId) {
+	return core.parseContextEntry(await host.storageGet(teamContextKey(teamId, contextId)));
+}
+
+async function writeContextEntry(teamId, entry) {
+	await host.storageSet(teamContextKey(teamId, entry.id), entry);
+}
+
+async function writeContextIndex(teamId, index) {
+	await host.storageSet(teamContextIndexKey(teamId), index);
+}
+
+async function loadContextEntries(teamId, index, limit = core.CONTEXT_LOG_LIMITS.maxEntries) {
+	const entries = [];
+	for (const id of index.ids.slice(0, limit)) {
+		const entry = await readContextEntry(teamId, id);
+		if (entry) entries.push(entry);
+	}
+	return entries;
 }
 
 /** Load the newest N task records for a team (index is newest-first). */
@@ -134,10 +173,21 @@ function makeNarratorSnapshot(narrators, known = true) {
 	};
 }
 
+let narratorSnapshotRequestSeq = 0;
+let narratorSnapshotAppliedSeq = 0;
+
 async function readNarratorSnapshot() {
+	const requestSeq = ++narratorSnapshotRequestSeq;
 	try {
 		const snapshot = makeNarratorSnapshot(await host.listNarrators({ limit: 100 }));
-		lastKnownNarratorSnapshot = snapshot;
+		// Concurrent maintenance/status passes can finish out of order. Only let
+		// the newest started query replace the cache; otherwise an older positive
+		// result may overwrite a newer deletion snapshot and make dispatch retry a
+		// host lookup that is no longer necessary (or can deadlock during teardown).
+		if (requestSeq >= narratorSnapshotAppliedSeq) {
+			narratorSnapshotAppliedSeq = requestSeq;
+			lastKnownNarratorSnapshot = snapshot;
+		}
 		return snapshot;
 	} catch {
 		return makeNarratorSnapshot([], false);
@@ -151,6 +201,14 @@ async function readNarratorSnapshot() {
  */
 let narratorSnapshotPromise = null;
 let lastKnownNarratorSnapshot = null;
+const missingNarratorIds = new Set();
+
+function rememberMissingTeamMembers(team, snapshot) {
+	if (!team || snapshot?.known !== true) return;
+	for (const memberId of team.members ?? []) {
+		if (!snapshotHasNarrator(snapshot, memberId)) missingNarratorIds.add(memberId);
+	}
+}
 function readSharedNarratorSnapshot() {
 	if (!narratorSnapshotPromise) {
 		narratorSnapshotPromise = readNarratorSnapshot().finally(() => {
@@ -176,6 +234,7 @@ function snapshotHasNarrator(snapshot, narratorId) {
 async function pruneTeamTasks(teamId, narratorSnapshot) {
 	try {
 		const team = await readTeamConfig(teamId);
+		rememberMissingTeamMembers(team, narratorSnapshot);
 		const index = await readTeamIndex(teamId);
 		// 1) Retire queued/sent tasks whose member left the team or whose host
 		// narrator disappeared. Both states are terminal and can be pruned later.
@@ -332,6 +391,23 @@ async function resolveTeamFor(teamId, callerNarratorId) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Enable the host's per-narrator ExitPlanMode reflection auto-approval for a
+ * worker. This only enables the existing reflection path; the host still
+ * enforces permission-mode and safety checks. Best-effort so a profile update
+ * outage cannot strand a persisted team task.
+ */
+async function ensureWorkerPlanReflection(memberId) {
+	try {
+		await host.updateNarratorProfile(memberId, {
+			planReflectionAutoApproveOverride: "on",
+		});
+	} catch {
+		// Keep dispatch resilient; newly recruited workers already receive the
+		// setting at creation time, and queued tasks can retry this on delivery.
+	}
+}
+
+/**
  * Dispatch a task to a team member.
  * @returns {Promise<{ ok: true, taskId: string, seq: number, status: string, busy?: boolean, hint?: string }
  *                   | { ok: false, reason: string }>}
@@ -349,8 +425,9 @@ async function dispatchTask(input, callerNarratorId, now = new Date().toISOStrin
 	// frame, so this fast path must not perform another plugin → host call.
 	if (
 		typeof memberId === "string" &&
-		lastKnownNarratorSnapshot?.known === true &&
-		!snapshotHasNarrator(lastKnownNarratorSnapshot, memberId)
+		(missingNarratorIds.has(memberId) ||
+			(lastKnownNarratorSnapshot?.known === true &&
+				!snapshotHasNarrator(lastKnownNarratorSnapshot, memberId)))
 	) {
 		return { ok: false, reason: `Member narrator no longer exists: ${memberId}` };
 	}
@@ -364,6 +441,7 @@ async function dispatchTask(input, callerNarratorId, now = new Date().toISOStrin
 		!snapshotHasNarrator(lastKnownNarratorSnapshot, memberId)
 			? lastKnownNarratorSnapshot
 			: await readSharedNarratorSnapshot();
+
 
 	const team = await resolveTeamFor(teamId, callerNarratorId);
 	if (!team) {
@@ -382,10 +460,10 @@ async function dispatchTask(input, callerNarratorId, now = new Date().toISOStrin
 	// not create a new queue entry or re-mirror the spec queue. Only the leader
 	// may add follow-ups (workers report through team.report instead).
 	if (followUp) {
-		if (team.leaderId !== callerNarratorId) {
-			return { ok: false, reason: "Only the team leader can add follow-up instructions" };
+		if (!core.isTeamLeader(team, callerNarratorId)) {
+			return { ok: false, reason: "Only a team leader can add follow-up instructions" };
 		}
-		return dispatchFollowUp(team, { memberId, instruction: task, priority, now });
+		return dispatchFollowUp(team, { memberId, instruction: task, priority, now, callerNarratorId });
 	}
 
 	if (typeof memberId !== "string" || memberId.length === 0) {
@@ -394,8 +472,8 @@ async function dispatchTask(input, callerNarratorId, now = new Date().toISOStrin
 	if (!team.members.includes(memberId)) {
 		return { ok: false, reason: `Not a team member: ${memberId}` };
 	}
-	if (memberId === team.leaderId) {
-		return { ok: false, reason: "Cannot dispatch a task to the team leader" };
+	if (core.isTeamLeader(team, memberId)) {
+		return { ok: false, reason: "Cannot dispatch a task to a team leader" };
 	}
 	// Do not create queue/spec records or call any member-facing host command
 	// when the persisted member was deleted directly by the host.
@@ -404,6 +482,7 @@ async function dispatchTask(input, callerNarratorId, now = new Date().toISOStrin
 		// event/status maintenance pass and make an already terminal dispatch
 		// wait behind the full plugin RPC deadline. Retire only this team's
 		// orphan tasks, then fail before any member-facing operation.
+		rememberMissingTeamMembers(team, narratorSnapshot);
 		await pruneTeamTasksForDispatch(team, narratorSnapshot);
 		return { ok: false, reason: `Member narrator no longer exists: ${memberId}` };
 	}
@@ -455,6 +534,10 @@ async function dispatchTask(input, callerNarratorId, now = new Date().toISOStrin
 	} catch {
 		// spec queue is best-effort; the message channel still delivers the task
 	}
+
+	// Existing team members may have been added before this automation was
+	// enabled; make sure their plan reflection setting is repaired before delivery.
+	await ensureWorkerPlanReflection(memberId);
 
 	// Subagents have no direct message channel: the host delivers to them via
 	// send_subagent_message (running → buffered for the next safe boundary,
@@ -599,7 +682,7 @@ async function dispatchTask(input, callerNarratorId, now = new Date().toISOStrin
  * @returns {Promise<{ ok: true, teamId: string, taskId: string, status: string, hint?: string }
  *                   | { ok: false, reason: string }>}
  */
-async function dispatchFollowUp(team, { memberId, instruction, priority, now }) {
+async function dispatchFollowUp(team, { memberId, instruction, priority, now, callerNarratorId }) {
 	if (typeof memberId !== "string" || memberId.length === 0) {
 		return { ok: false, reason: "memberId is required" };
 	}
@@ -609,8 +692,8 @@ async function dispatchFollowUp(team, { memberId, instruction, priority, now }) 
 	if (!core.narratorInTeam(team, memberId)) {
 		return { ok: false, reason: `Not a team member: ${memberId}` };
 	}
-	if (memberId === team.leaderId) {
-		return { ok: false, reason: "Cannot send a follow-up to the team leader" };
+	if (core.isTeamLeader(team, memberId)) {
+		return { ok: false, reason: "Cannot send a follow-up to a team leader" };
 	}
 	const narratorSnapshot = await readNarratorSnapshot();
 	if (!narratorSnapshot.known) {
@@ -643,7 +726,7 @@ async function dispatchFollowUp(team, { memberId, instruction, priority, now }) 
 
 	const prompt = core.followUpPrompt(targetTask, instruction);
 	const withThread = core.appendFollowUp(targetTask, {
-		fromId: team.leaderId,
+		fromId: callerNarratorId,
 		toId: memberId,
 		text: typeof instruction === "string" ? instruction.trim() : "",
 		now,
@@ -786,15 +869,16 @@ async function waitForNarratorIdle(narratorId, timeoutMs = HIGH_INTERRUPT_IDLE_W
  * leader），其行为准则由 manifest 工具描述常驻注入。
  */
 function buildOutboundPrompt(task, team) {
+	const marker = `${TEAM_TASK_MARKER}${task.id}（${task.priority ?? "normal"}）]`;
 	const hint =
-		`\n\n[团队任务 ${task.id}（${task.priority ?? "normal"}）] 这是 Leader 指派的任务。完成后请调用 team.report 工具，向 Leader 汇报结果摘要。`;
+		`\n\n${marker} 这是 Leader 指派的团队任务。完成这个带标记的任务后，请调用 team.report，并传入 taskId="${task.id}"、teamId="${team.id}" 和结果摘要。没有该标记的用户直接任务不要调用 team.report，也不要向 Leader 汇报。`;
 	const sop = teamSopForRole(core.memberRole(team, task.memberId));
 	return `${task.prompt}${hint}\n\n${sop}`;
 }
 
 /** Host spec://tasks.json text for a dispatched team task (stable match key). */
 function taskSpecText(taskId, priority, prompt) {
-	const prefix = `[团队任务 ${taskId}（${priority}）]`;
+	const prefix = `${TEAM_TASK_MARKER}${taskId}（${priority}）]`;
 	const trimmed = typeof prompt === "string" ? prompt.trim() : "";
 	// spec task text is capped at 1000 characters by the host.
 	const maxPromptChars = 950;
@@ -917,6 +1001,7 @@ async function retryQueuedTasksOnStatus(narratorSnapshot = undefined) {
 			if (!task || task.status !== "queued") continue;
 			if (!snapshotHasNarrator(snapshot, task.memberId)) continue;
 			if (busy.has(task.memberId)) continue;
+			await ensureWorkerPlanReflection(task.memberId);
 			// Subagents: deliver through the host's subagent channel; failures
 			// (e.g. never started by the parent) mark the task failed once.
 			if (await isSubagentNarrator(task.memberId)) {
@@ -992,6 +1077,9 @@ async function buildStatus(input, callerNarratorId) {
 	}));
 
 	const teamIds = await listTeamIds();
+	for (const id of teamIds) {
+		rememberMissingTeamMembers(await readTeamConfig(id), narratorSnapshot);
+	}
 	const teams = [];
 	if (teamId !== undefined) {
 		if (!teamIds.includes(teamId)) {
@@ -1013,6 +1101,84 @@ async function buildStatus(input, callerNarratorId) {
 		}
 	}
 	return { ok: true, teams, availableNarrators };
+}
+
+// ---------------------------------------------------------------------------
+// Shared context flow
+// ---------------------------------------------------------------------------
+
+async function broadcastContext(input, callerNarratorId, now = new Date().toISOString()) {
+	if (!input || typeof input !== "object") return { ok: false, reason: "Invalid context input" };
+	const team = await resolveTeamFor(input.teamId, callerNarratorId);
+	if (!team) return { ok: false, reason: "Caller belongs to no team; pass teamId or configure a team first" };
+	if (!core.narratorInTeam(team, callerNarratorId)) return { ok: false, reason: `Not a member of team: ${team.id}` };
+	const text = typeof input.text === "string" ? input.text.trim() : "";
+	if (!text) return { ok: false, reason: "text is required" };
+	const targets = Array.isArray(input.targetNarratorIds)
+		? [...new Set(input.targetNarratorIds.filter((id) => typeof id === "string" && id.length > 0))]
+		: team.members.filter((id) => id !== callerNarratorId);
+	if (targets.length === 0) return { ok: false, reason: "At least one target narrator is required" };
+	if (targets.length > core.CONTEXT_LOG_LIMITS.maxTargets) return { ok: false, reason: "Too many target narrators" };
+	for (const target of targets) {
+		if (!core.narratorInTeam(team, target)) return { ok: false, reason: `Not a team member: ${target}` };
+	}
+	const contextId = typeof input.contextId === "string" && input.contextId.trim().length > 0
+		? input.contextId.trim()
+		: core.makeContextId(`${Date.now()}-${makeShortSuffix()}`);
+	const entry = core.parseContextEntry({
+		id: contextId,
+		kind: input.kind,
+		text,
+		payload: input.payload,
+		sourceNarratorId: callerNarratorId,
+		targetNarratorIds: targets,
+		createdAt: now,
+	});
+	if (!entry) return { ok: false, reason: "Invalid context record" };
+
+	const existing = await readContextEntry(team.id, entry.id);
+	if (existing) {
+		if (JSON.stringify(existing) !== JSON.stringify(entry)) return { ok: false, reason: `Context id already exists with different content: ${entry.id}` };
+		try {
+			const receipt = await host.getNarratorContextDeliveries({ contextId: entry.id });
+			return { ok: true, teamId: team.id, contextId: entry.id, status: "already_pending", receipt };
+		} catch {
+			return { ok: true, teamId: team.id, contextId: entry.id, status: "already_pending" };
+		}
+	}
+
+	await writeContextEntry(team.id, entry);
+	const nextIndex = core.appendContextIndex(await readContextIndex(team.id), entry.id);
+	await writeContextIndex(team.id, nextIndex);
+	for (const trimmedId of nextIndex.trimmed) {
+		try {
+			await host.storageDelete(teamContextKey(team.id, trimmedId));
+		} catch {
+			// Retention cleanup is best-effort; the bounded index remains authoritative.
+		}
+	}
+	try {
+		const result = await host.deliverNarratorContext({
+			contextId: entry.id,
+			kind: entry.kind,
+			text: entry.text,
+			payload: entry.payload,
+			sourceNarratorId: entry.sourceNarratorId,
+			targetNarratorIds: entry.targetNarratorIds,
+			createdAt: entry.createdAt,
+		}, { idempotencyKey: entry.id });
+		return { ok: true, teamId: team.id, contextId: entry.id, status: result?.status ?? "accepted", deliveries: result?.deliveries ?? [] };
+	} catch (error) {
+		return { ok: false, reason: `Context delivery failed: ${error.message}`, contextId: entry.id, persisted: true };
+	}
+}
+
+async function listContextLog(input, callerNarratorId) {
+	const team = await resolveTeamFor(input?.teamId, callerNarratorId);
+	if (!team) return { ok: false, reason: "Team not found" };
+	if (!core.narratorInTeam(team, callerNarratorId)) return { ok: false, reason: `Not a team member: ${team.id}` };
+	const entries = await loadContextEntries(team.id, await readContextIndex(team.id), Math.min(Number(input?.limit) || 50, core.CONTEXT_LOG_LIMITS.maxEntries));
+	return { ok: true, teamId: team.id, entries: core.filterContextEntries(entries, input ?? {}) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1040,6 +1206,24 @@ async function invokeContribution(contributionId, input, callerNarratorId) {
 				}),
 				title: result.status === "sent" ? "Task dispatched" : "Task queued",
 				metadata: { teamId: result.teamId, taskId: result.taskId, seq: result.seq, status: result.status },
+			};
+		}
+		case "team.context_broadcast": {
+			const result = await broadcastContext(input, callerNarratorId);
+			if (!result.ok) throw new ContributionError("INVALID_PARAMS", result.reason);
+			return {
+				output: JSON.stringify(result),
+				title: result.status === "already_pending" ? "Team context already delivered" : "Team context broadcast",
+				metadata: { teamId: result.teamId, contextId: result.contextId, status: result.status },
+			};
+		}
+		case "team.context_log": {
+			const result = await listContextLog(input, callerNarratorId);
+			if (!result.ok) throw new ContributionError("INVALID_PARAMS", result.reason);
+			return {
+				output: JSON.stringify(result),
+				title: "Team context log",
+				metadata: { teamId: result.teamId, count: result.entries.length },
 			};
 		}
 		case "team.status": {
@@ -1070,12 +1254,14 @@ async function invokeContribution(contributionId, input, callerNarratorId) {
 				output: JSON.stringify({
 					ok: true,
 					teamId: result.config.id,
+					leaderIds: result.config.leaderIds,
 					leaderId: result.config.leaderId,
 					members: result.config.members,
 				}),
 				title: "Team configured",
 				metadata: {
 					teamId: result.config.id,
+					leaderIds: result.config.leaderIds,
 					leaderId: result.config.leaderId,
 					memberCount: result.config.members.length,
 				},
@@ -1189,6 +1375,7 @@ async function configureTeam(input, callerNarratorId) {
 			// Create a fresh team owned by the caller.
 			const teamId = core.makeTeamId(makeShortSuffix());
 			team = core.defaultTeam(teamId, now);
+			team.leaderIds = [callerNarratorId];
 			team.leaderId = callerNarratorId;
 			team.members = [callerNarratorId];
 		}
@@ -1205,9 +1392,9 @@ async function configureTeam(input, callerNarratorId) {
 	}
 
 	const config = core.applyTeamPatch(team, patch, now);
-	// The leader is always a member: keep the invariant that leader ∈ members.
-	if (config.leaderId !== null && !config.members.includes(config.leaderId)) {
-		config.members = [config.leaderId, ...config.members];
+	// Every leader is always a member: keep the invariant leaderIds ⊆ members.
+	for (const leaderId of config.leaderIds ?? []) {
+		if (!config.members.includes(leaderId)) config.members.unshift(leaderId);
 	}
 	const narrators = await host.listNarrators({ limit: 100 });
 	const validation = core.validateTeamConfig(config, { narrators });
@@ -1249,7 +1436,7 @@ async function recruitWorker(input, callerNarratorId) {
 		return { ok: false, reason: `Not a member of team: ${team.id}` };
 	}
 	// Only the leader may recruit regular members; anyone may recruit temp workers.
-	if (role === "member" && team.leaderId !== callerNarratorId) {
+	if (role === "member" && !core.isTeamLeader(team, callerNarratorId)) {
 		return { ok: false, reason: "Only the team leader can recruit regular members" };
 	}
 	if (team.members.length >= core.QUEUE_LIMITS.maxMembers) {
@@ -1262,6 +1449,9 @@ async function recruitWorker(input, callerNarratorId) {
 			type: role === "temp" ? "subagent" : "primary",
 			title: typeof input.title === "string" && input.title.length > 0 ? input.title : undefined,
 			model: typeof input.model === "string" && input.model.length > 0 ? input.model : undefined,
+			// Team workers should have their plans reviewed automatically by the host's
+			// reflection loop instead of waiting for a human plan approval card.
+			planReflectionAutoApproveOverride: "on",
 			// Temp workers inherit the recruiter's workspace so they can explore the same codebase.
 			cwd: typeof input.cwd === "string" && input.cwd.length > 0 ? input.cwd : undefined,
 			subagentType:
@@ -1282,6 +1472,7 @@ async function recruitWorker(input, callerNarratorId) {
 	// the next dispatch/status request must refresh it before deciding whether
 	// the new member can receive work.
 	lastKnownNarratorSnapshot = null;
+	missingNarratorIds.delete(memberId);
 	const now = new Date().toISOString();
 
 	const next = core.addTeamMember(team, {
@@ -1329,7 +1520,7 @@ async function fireWorker(input, callerNarratorId) {
 		return { ok: false, reason: `Not a member of team: ${memberId}` };
 	}
 	const role = core.memberRole(team, memberId);
-	const isLeader = team.leaderId === callerNarratorId;
+	const isLeader = core.isTeamLeader(team, callerNarratorId);
 	if (!isLeader) {
 		const recruiter = team.recruitedBy?.[memberId];
 		if (role !== "temp" || recruiter !== callerNarratorId) {
@@ -1441,22 +1632,18 @@ async function updateMemberProfile(input, callerNarratorId) {
 //
 // The plugin is event-driven, not resident, but it stays alive until the host
 // recycles it (60-minute cap / idle). While alive it subscribes to narrator
-// lifecycle + message events so that:
+// lifecycle + spec events so that:
 //   - a member going idle re-dispatches any queued task targeted at them
 //     (a busy member used to leave tasks stuck in `queued` forever);
-//   - a member sending a message after a task was dispatched marks the task
-//     done and notifies the leader that progress came back.
+//   - a member's Dynamic Spec task status synchronizes the corresponding team
+//     task. Ordinary chat messages never imply team-task completion.
 
 let eventSubscription = null;
 let eventPollTimer = null;
 let eventPollInFlight = false;
 
 const EVENT_POLL_INTERVAL_MS = 30_000;
-const EVENT_TOPICS = [
-	"narrafork.narrator.lifecycle",
-	"narrafork.narrator.message.changed",
-	"narrafork.narrator.spec.changed",
-];
+const EVENT_TOPICS = ["narrafork.narrator.lifecycle", "narrafork.narrator.spec.changed"];
 
 /** Subscribe to team-relevant events and start polling (best-effort). */
 async function setupEventSubscription() {
@@ -1465,7 +1652,9 @@ async function setupEventSubscription() {
 		const memberIds = new Set();
 		for (const teamId of await listTeamIds()) {
 			const team = await readTeamConfig(teamId);
-			if (team.leaderId) memberIds.add(team.leaderId);
+			for (const leaderId of team.leaderIds ?? (team.leaderId ? [team.leaderId] : [])) {
+				memberIds.add(leaderId);
+			}
 			for (const member of team.members) memberIds.add(member);
 		}
 		const result = await host.subscribeEvents({
@@ -1547,8 +1736,6 @@ async function handleTeamEvent(event) {
 	if (event.topic === "narrafork.narrator.lifecycle") {
 		const status = event.data && typeof event.data === "object" ? event.data.status : undefined;
 		if (status === "idle") await retryQueuedTasks(narratorId);
-	} else if (event.topic === "narrafork.narrator.message.changed") {
-		await markMemberResponded(narratorId);
 	} else if (event.topic === "narrafork.narrator.spec.changed") {
 		// A member's spec://tasks.json changed (e.g. the team task was marked
 		// done/blocked): sync that member's open team tasks.
@@ -1601,6 +1788,7 @@ async function retryQueuedTasks(memberId) {
 			}
 		}
 		if (!task || task.status !== "queued" || task.memberId !== memberId) continue;
+		await ensureWorkerPlanReflection(memberId);
 		// Subagents: deliver through the host's subagent channel (see dispatch).
 		if (await isSubagentNarrator(memberId)) {
 			try {
@@ -1666,58 +1854,30 @@ async function deliverFollowUpPrompt(teamId, task, prompt, memberId) {
 	}
 }
 
-/** A member sent a message: complete their open sent tasks and tell the leader. */
-async function markMemberResponded(memberId) {
-	for (const teamId of await listTeamIds()) {
-		const team = await readTeamConfig(teamId);
-		const index = await readTeamIndex(teamId);
-		let completed = false;
-		let completedTasks = [];
-		for (const taskId of index.ids) {
-			const seq = Number(taskId.replace(/^task-/, ""));
-			if (!Number.isInteger(seq)) continue;
-			const task = await readTeamTask(teamId, seq);
-			if (!task || task.status !== "sent" || task.memberId !== memberId) continue;
-			const updated = core.updateTaskStatus(task, "done", {});
-			if (updated.ok) {
-				await writeTeamTask(teamId, updated.task);
-				completed = true;
-				completedTasks.push(task);
-			}
-		}
-		if (completed && team.leaderId && team.leaderId !== memberId) {
-			// Collaboration visibility: include the member's actual latest reply
-			// (truncated) so the leader sees real progress without opening the
-			// chat page. Fall back to a task list when the message read fails.
-			let summary = null;
-			try {
-				const messages = await host.listMessages(memberId, 10);
-				summary = core.summarizeReplies(messages);
-			} catch {
-				// message read is best-effort; fall back below
-			}
-			const taskLabels = completedTasks
-				.map((task) => task.id)
-				.slice(0, 5)
-				.join(", ");
-			const body = summary
-				? `团队成员 ${memberId} 已就任务做出回复：${summary}`
-				: `团队成员 ${memberId} 已就任务做出回复（${taskLabels || "无"}），请查看最新进展。`;
-			try {
-				await host.sendMessage(team.leaderId, body, {
-					idempotencyKey: `team-notify-${memberId}-${Date.now()}`,
-				});
-			} catch {
-				// leader notification is best-effort
-			}
+/** Find a member-owned team task by task id, searching all matching teams when needed. */
+async function findReportTask(taskId, teamId, callerNarratorId) {
+	if (typeof taskId !== "string" || !taskId.trim()) return null;
+	const requestedTeamIds =
+		typeof teamId === "string" && teamId.length > 0 ? [teamId] : await listTeamIds();
+	const matches = [];
+	for (const candidateTeamId of requestedTeamIds) {
+		const team = await readTeamConfig(candidateTeamId);
+		if (!core.narratorInTeam(team, callerNarratorId)) continue;
+		const seq = Number(taskId.replace(/^task-/, ""));
+		if (!Number.isInteger(seq)) continue;
+		const task = await readTeamTask(candidateTeamId, seq);
+		if (task && task.id === taskId && task.memberId === callerNarratorId) {
+			matches.push({ team, task });
 		}
 	}
+	if (matches.length > 1) return { ambiguous: true };
+	return matches[0] ?? null;
 }
 
 /**
- * Member → leader task feedback. Marks the caller's sent tasks as done and
- * sends the summary to the leader (or to the team channel if the caller IS the
- * leader).
+ * Member → leader task feedback. Worker reports are bound to an explicit
+ * dispatched task id; ordinary user tasks cannot produce a team report.
+ * Leaders may still use the tool without taskId to send a team message.
  * @returns {Promise<{ ok: true, teamId: string, taskCount: number }
  *                  | { ok: false, reason: string }>}
  */
@@ -1730,20 +1890,49 @@ async function reportTaskResult(input, callerNarratorId) {
 	if (typeof callerNarratorId !== "string" || callerNarratorId.length === 0) {
 		return { ok: false, reason: "Report requires a team member context" };
 	}
-	const team = await resolveTeamFor(input.teamId, callerNarratorId);
+
+	const reportTarget =
+		typeof input.taskId === "string" && input.taskId.trim()
+			? await findReportTask(input.taskId, input.teamId, callerNarratorId)
+			: null;
+	if (reportTarget?.ambiguous) {
+		return { ok: false, reason: `Task id matches multiple teams; pass teamId: ${input.taskId}` };
+	}
+	const targetTask = reportTarget?.task ?? null;
+	// Reuse the team object returned by the task search when taskId disambiguates
+	// multiple memberships; otherwise preserve the existing team resolution path.
+	const team = reportTarget?.team ?? (await resolveTeamFor(input.teamId, callerNarratorId));
 	if (!team) return { ok: false, reason: "Caller belongs to no team; pass teamId" };
 	if (!core.narratorInTeam(team, callerNarratorId)) {
 		return { ok: false, reason: `Not a member of team: ${team.id}` };
 	}
 
-	// Mark the caller's open sent tasks as done.
+	const isLeader = core.isTeamLeader(team, callerNarratorId);
+	if (!isLeader) {
+		if (typeof input.taskId !== "string" || !input.taskId.trim()) {
+			return {
+				ok: false,
+				reason: "Worker report requires the taskId from the [团队任务 task-N...] marker; user tasks do not need team.report",
+			};
+		}
+		if (!targetTask) {
+			return { ok: false, reason: `Team task not found for worker: ${input.taskId}` };
+		}
+		if (!["queued", "sent", "done"].includes(targetTask.status)) {
+			return { ok: false, reason: `Team task cannot be reported in status: ${targetTask.status}` };
+		}
+	}
+
+	// Mark the selected worker task, or all open leader tasks, as done.
 	let taskCount = 0;
 	const index = await readTeamIndex(team.id);
 	for (const taskId of index.ids) {
 		const seq = Number(taskId.replace(/^task-/, ""));
 		if (!Number.isInteger(seq)) continue;
 		const task = await readTeamTask(team.id, seq);
-		if (!task || task.status !== "sent" || task.memberId !== callerNarratorId) continue;
+		if (!task || task.memberId !== callerNarratorId) continue;
+		if (!isLeader && task.id !== targetTask.id) continue;
+		if (task.status !== "sent") continue;
 		const updated = core.updateTaskStatus(task, "done", {});
 		if (updated.ok) {
 			await writeTeamTask(team.id, updated.task);
@@ -1751,17 +1940,22 @@ async function reportTaskResult(input, callerNarratorId) {
 		}
 	}
 
-	// Deliver the report to the leader (or echo to self when the caller leads).
-	const recipient = team.leaderId && team.leaderId !== callerNarratorId ? team.leaderId : callerNarratorId;
+	// Deliver the report to every other leader; echo to self only when the caller
+	// is the sole leader (preserving the legacy single-Leader behavior).
+	const leaderIds = team.leaderIds ?? (team.leaderId ? [team.leaderId] : []);
+	const recipients = leaderIds.filter((id) => id !== callerNarratorId);
+	if (recipients.length === 0) recipients.push(callerNarratorId);
 	const report =
-		`[团队任务汇报] 来自 ${callerNarratorId}：${summary}${taskCount > 0 ? `（已完成 ${taskCount} 项指派任务）` : ""}`;
-	try {
-		await host.sendMessage(recipient, report, {
-			idempotencyKey: `team-report-${callerNarratorId}-${Date.now()}`,
-		});
-	} catch (error) {
-		if (error.code !== "CONFLICT") {
-			return { ok: false, reason: `Failed to deliver report: ${error.message}` };
+		`[团队任务汇报] 来自 ${callerNarratorId}：${summary}${targetTask ? `（任务 ${targetTask.id}，${taskCount > 0 ? "已完成" : "已记录"}）` : taskCount > 0 ? `（已完成 ${taskCount} 项指派任务）` : ""}`;
+	for (const recipient of recipients) {
+		try {
+			await host.sendMessage(recipient, report, {
+				idempotencyKey: `team-report-${callerNarratorId}-${recipient}-${targetTask?.id ?? "leader"}-${Date.now()}`,
+			});
+		} catch (error) {
+			if (error.code !== "CONFLICT") {
+				return { ok: false, reason: `Failed to deliver report: ${error.message}` };
+			}
 		}
 	}
 	return { ok: true, teamId: team.id, taskCount };

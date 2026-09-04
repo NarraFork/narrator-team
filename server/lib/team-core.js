@@ -6,8 +6,8 @@
  *
  * Storage shapes (persisted under the plugin's `storage.read_self` namespace):
  *
- *   team.config   { name, leaderId, members: string[], memberRoles,
- *                   recruitedBy, updatedAt }
+ *   team.config   { name, leaderIds: string[], leaderId, members: string[],
+ *                   memberRoles, recruitedBy, updatedAt }
  *   tasks.index   { nextSeq: number, ids: string[] }   // newest first, capped
  *   tasks.<id>    { id, seq, memberId, prompt, status, assignedAt, messageId?, error? }
  *
@@ -38,6 +38,7 @@ export const QUEUE_SOFT_LIMIT = 50;
 export function defaultTeamConfig() {
 	return {
 		name: "",
+		leaderIds: [],
 		leaderId: null,
 		members: [],
 		memberRoles: {},
@@ -46,16 +47,27 @@ export function defaultTeamConfig() {
 	};
 }
 
+/** Normalize the canonical multi-Leader field while accepting legacy leaderId. */
+function normalizeLeaderIds(value) {
+	const source = Array.isArray(value?.leaderIds)
+		? value.leaderIds
+		: typeof value?.leaderId === "string"
+			? [value.leaderId]
+			: [];
+	return [...new Set(source)].filter((id) => typeof id === "string" && id.length > 0).slice(0, QUEUE_LIMITS.maxMembers);
+}
+
 /**
  * Parse and normalize a persisted team config (tolerant of missing fields).
  * @param {unknown} raw
- * @returns {{ name: string, leaderId: string | null, members: string[],
+ * @returns {{ name: string, leaderIds: string[], leaderId: string | null, members: string[],
  *             memberRoles: Record<string, "member" | "temp">,
  *             recruitedBy: Record<string, string>, updatedAt: string | null }}
  */
 export function parseTeamConfig(raw) {
 	if (typeof raw !== "object" || raw === null) return defaultTeamConfig();
 	const value = raw;
+	const leaderIds = normalizeLeaderIds(value);
 	const members = Array.isArray(value.members)
 		? value.members
 				.filter((member) => typeof member === "string")
@@ -75,7 +87,8 @@ export function parseTeamConfig(raw) {
 	}
 	return {
 		name: typeof value.name === "string" ? value.name.slice(0, 120) : "",
-		leaderId: typeof value.leaderId === "string" ? value.leaderId : null,
+		leaderIds,
+		leaderId: leaderIds[0] ?? null,
 		members,
 		memberRoles,
 		recruitedBy,
@@ -97,13 +110,14 @@ export function isTempWorker(config, memberId) {
  * Merge a partial config update into an existing config.
  * Null/undefined fields are left untouched; empty string clears name.
  * @param {ReturnType<typeof parseTeamConfig>} current
- * @param {{ name?: string, leaderId?: string | null, members?: string[] }} patch
+ * @param {{ name?: string, leaderIds?: string[], leaderId?: string | null, members?: string[] }} patch
  * @param {string} now — ISO timestamp
  * @returns {ReturnType<typeof parseTeamConfig>}
  */
 export function applyTeamConfigPatch(current, patch, now) {
 	const next = {
 		name: current.name,
+		leaderIds: [...(current.leaderIds ?? (current.leaderId ? [current.leaderId] : []))],
 		leaderId: current.leaderId,
 		members: [...current.members],
 		memberRoles: { ...current.memberRoles },
@@ -113,9 +127,16 @@ export function applyTeamConfigPatch(current, patch, now) {
 	if (patch.name !== undefined && patch.name !== null) {
 		next.name = String(patch.name).slice(0, 120);
 	}
-	if (patch.leaderId !== undefined) {
-		next.leaderId = typeof patch.leaderId === "string" ? patch.leaderId : null;
+	if (patch.leaderIds !== undefined) {
+		next.leaderIds = Array.isArray(patch.leaderIds)
+			? [...new Set(patch.leaderIds)]
+					.filter((id) => typeof id === "string" && id.length > 0)
+					.slice(0, QUEUE_LIMITS.maxMembers)
+			: [];
+	} else if (patch.leaderId !== undefined) {
+		next.leaderIds = typeof patch.leaderId === "string" && patch.leaderId.length > 0 ? [patch.leaderId] : [];
 	}
+	next.leaderId = next.leaderIds[0] ?? null;
 	if (Array.isArray(patch.members)) {
 		const members = [...new Set(patch.members)]
 			.filter((member) => typeof member === "string")
@@ -127,6 +148,11 @@ export function applyTeamConfigPatch(current, patch, now) {
 		}
 		for (const id of Object.keys(next.recruitedBy)) {
 			if (!members.includes(id)) delete next.recruitedBy[id];
+		}
+	}
+	for (const leaderId of next.leaderIds) {
+		if (!next.members.includes(leaderId) && next.members.length < QUEUE_LIMITS.maxMembers) {
+			next.members.unshift(leaderId);
 		}
 	}
 	return next;
@@ -161,11 +187,20 @@ export function addTeamMember(config, { id, role = "member", recruitedBy = null,
  */
 export function removeTeamMember(config, id) {
 	const members = config.members.filter((member) => member !== id);
+	const leaderIds = (config.leaderIds ?? (config.leaderId ? [config.leaderId] : [])).filter((leaderId) => leaderId !== id);
 	const memberRoles = { ...config.memberRoles };
 	const recruited = { ...config.recruitedBy };
 	delete memberRoles[id];
 	delete recruited[id];
-	return { ...config, members, memberRoles, recruitedBy: recruited, updatedAt: config.updatedAt };
+	return {
+		...config,
+		leaderIds,
+		leaderId: leaderIds[0] ?? null,
+		members,
+		memberRoles,
+		recruitedBy: recruited,
+		updatedAt: config.updatedAt,
+	};
 }
 
 /**
@@ -177,8 +212,9 @@ export function removeTeamMember(config, id) {
 export function validateTeamConfig(config, { narrators }) {
 	const errors = [];
 	const known = new Set((narrators ?? []).map((narrator) => narrator.id));
-	if (config.leaderId !== null && !known.has(config.leaderId)) {
-		errors.push(`Leader narrator not found: ${config.leaderId}`);
+	const leaderIds = config.leaderIds ?? (config.leaderId ? [config.leaderId] : []);
+	for (const leaderId of leaderIds) {
+		if (!known.has(leaderId)) errors.push(`Leader narrator not found: ${leaderId}`);
 	}
 	for (const member of config.members) {
 		if (!known.has(member)) errors.push(`Member narrator not found: ${member}`);
@@ -358,7 +394,7 @@ export function planMemberProfilePatch(team, callerId, input) {
 		return { ok: false, reason: `Not a team member: ${memberId}` };
 	}
 	const role = memberRole(team, memberId);
-	const isLeader = team.leaderId === callerId;
+	const isLeader = isTeamLeader(team, callerId);
 	if (!isLeader) {
 		const recruiter = team.recruitedBy?.[memberId];
 		if (role !== "temp" || recruiter !== callerId) {
@@ -502,8 +538,8 @@ export function planDispatch(config, input, context) {
 	if (!config.members.includes(memberId)) {
 		return { ok: false, reason: `Not a team member: ${memberId}` };
 	}
-	if (config.leaderId !== null && memberId === config.leaderId) {
-		return { ok: false, reason: "Cannot dispatch a task to the team leader" };
+	if (isTeamLeader(config, memberId)) {
+		return { ok: false, reason: "Cannot dispatch a task to a team leader" };
 	}
 	const taskRecord = createTask(context.index, {
 		memberId,
@@ -544,7 +580,9 @@ export function buildStatusView(config, { narrators, tasks }) {
 		role: memberRole(config, id),
 		recruitedBy: config.recruitedBy?.[id] ?? null,
 	}));
-	const leader = config.leaderId === null ? null : summarizeNarrator(config.leaderId);
+	const leaderIds = config.leaderIds ?? (config.leaderId ? [config.leaderId] : []);
+	const leaders = leaderIds.map((id) => summarizeNarrator(id));
+	const leader = leaders[0] ?? null;
 	const queue = (tasks ?? []).map((task) => ({
 		id: task.id,
 		seq: task.seq,
@@ -564,7 +602,9 @@ export function buildStatusView(config, { narrators, tasks }) {
 	return {
 		id: config.id ?? null,
 		name: config.name,
-		leaderId: config.leaderId,
+		leaderIds,
+		leaderId: leaderIds[0] ?? null,
+		leaders,
 		leader,
 		members,
 		queue,
@@ -603,6 +643,7 @@ export function defaultTeam(id, now) {
 	return {
 		id,
 		name: "",
+		leaderIds: [],
 		leaderId: null,
 		members: [],
 		memberRoles: {},
@@ -627,7 +668,7 @@ function parseMemberMetadata(members, value, pick) {
 /**
  * Parse and normalize a persisted team record (new multi-team shape).
  * @param {unknown} raw
- * @returns {{ id: string, name: string, leaderId: string | null, members: string[],
+ * @returns {{ id: string, name: string, leaderIds: string[], leaderId: string | null, members: string[],
  *             memberRoles: Record<string, "member" | "temp">,
  *             recruitedBy: Record<string, string>,
  *             createdAt: string | null, updatedAt: string | null }}
@@ -636,6 +677,7 @@ export function parseTeam(raw) {
 	if (typeof raw !== "object" || raw === null) return defaultTeam("team", null);
 	const value = raw;
 	const id = typeof value.id === "string" && value.id.trim().length > 0 ? value.id : "team";
+	const leaderIds = normalizeLeaderIds(value);
 	const members = Array.isArray(value.members)
 		? value.members
 				.filter((member) => typeof member === "string")
@@ -644,7 +686,8 @@ export function parseTeam(raw) {
 	return {
 		id,
 		name: typeof value.name === "string" ? value.name.slice(0, 120) : "",
-		leaderId: typeof value.leaderId === "string" ? value.leaderId : null,
+		leaderIds,
+		leaderId: leaderIds[0] ?? null,
 		members,
 		memberRoles: parseMemberMetadata(members, value.memberRoles, (entry) =>
 			MEMBER_ROLES.includes(entry) ? entry : undefined,
@@ -659,9 +702,9 @@ export function parseTeam(raw) {
 
 /**
  * Merge a partial update into an existing team. Null/undefined fields are left
- * untouched; empty string clears name; null clears leaderId.
+ * untouched; empty string clears name; null clears leaderId/leaderIds.
  * @param {ReturnType<typeof parseTeam>} current
- * @param {{ name?: string, leaderId?: string | null, members?: string[] }} patch
+ * @param {{ name?: string, leaderIds?: string[], leaderId?: string | null, members?: string[] }} patch
  * @param {string} now — ISO timestamp
  * @returns {ReturnType<typeof parseTeam>}
  */
@@ -669,6 +712,7 @@ export function applyTeamPatch(current, patch, now) {
 	const next = {
 		id: current.id,
 		name: current.name,
+		leaderIds: [...(current.leaderIds ?? (current.leaderId ? [current.leaderId] : []))],
 		leaderId: current.leaderId,
 		members: [...current.members],
 		memberRoles: { ...current.memberRoles },
@@ -679,9 +723,16 @@ export function applyTeamPatch(current, patch, now) {
 	if (patch.name !== undefined && patch.name !== null) {
 		next.name = String(patch.name).slice(0, 120);
 	}
-	if (patch.leaderId !== undefined) {
-		next.leaderId = typeof patch.leaderId === "string" ? patch.leaderId : null;
+	if (patch.leaderIds !== undefined) {
+		next.leaderIds = Array.isArray(patch.leaderIds)
+			? [...new Set(patch.leaderIds)]
+					.filter((id) => typeof id === "string" && id.length > 0)
+					.slice(0, QUEUE_LIMITS.maxMembers)
+			: [];
+	} else if (patch.leaderId !== undefined) {
+		next.leaderIds = typeof patch.leaderId === "string" && patch.leaderId.length > 0 ? [patch.leaderId] : [];
 	}
+	next.leaderId = next.leaderIds[0] ?? null;
 	if (Array.isArray(patch.members)) {
 		const members = [...new Set(patch.members)]
 			.filter((member) => typeof member === "string")
@@ -695,7 +746,19 @@ export function applyTeamPatch(current, patch, now) {
 			if (!members.includes(key)) delete next.recruitedBy[key];
 		}
 	}
+	for (const leaderId of next.leaderIds) {
+		if (!next.members.includes(leaderId) && next.members.length < QUEUE_LIMITS.maxMembers) {
+			next.members.unshift(leaderId);
+		}
+	}
 	return next;
+}
+
+/** Whether a narrator has Leader permissions in the team. */
+export function isTeamLeader(team, narratorId) {
+	if (!team || typeof narratorId !== "string" || narratorId.length === 0) return false;
+	const leaderIds = team.leaderIds ?? (team.leaderId ? [team.leaderId] : []);
+	return leaderIds.includes(narratorId);
 }
 
 /**
@@ -705,8 +768,7 @@ export function applyTeamPatch(current, patch, now) {
  */
 export function narratorInTeam(team, narratorId) {
 	if (!team || typeof narratorId !== "string" || narratorId.length === 0) return false;
-	if (team.leaderId === narratorId) return true;
-	return team.members.includes(narratorId);
+	return isTeamLeader(team, narratorId) || team.members.includes(narratorId);
 }
 
 /**
@@ -726,6 +788,7 @@ export async function migrateLegacyTeam(rawConfig, rawIndex, readTask) {
 	const team = {
 		...defaultTeam(LEGACY_TEAM_ID, now),
 		name: legacy.name,
+		leaderIds: legacy.leaderIds ?? (legacy.leaderId ? [legacy.leaderId] : []),
 		leaderId: legacy.leaderId,
 		members: legacy.members,
 		memberRoles: legacy.memberRoles,
@@ -740,6 +803,78 @@ export async function migrateLegacyTeam(rawConfig, rawIndex, readTask) {
 	// Tasks are re-keyed under the team namespace; the team index mirrors the
 	// legacy newest-first order.
 	return { team, tasks, index };
+}
+
+// ---------------------------------------------------------------------------
+// Shared context log (leader ↔ workers)
+// ---------------------------------------------------------------------------
+
+export const CONTEXT_LOG_LIMITS = Object.freeze({
+	maxEntries: 500,
+	maxTextChars: 4000,
+	maxPayloadKeys: 24,
+	maxTargets: 50,
+});
+
+export const CONTEXT_KINDS = Object.freeze(["fact", "result", "decision", "artifact", "instruction", "status"]);
+
+export function makeContextId(suffix) {
+	const value = String(suffix ?? "").trim();
+	return value ? `ctx-${value}` : "ctx";
+}
+
+export function parseContextIndex(raw) {
+	if (!raw || typeof raw !== "object") return { ids: [] };
+	const ids = Array.isArray(raw.ids)
+		? [...new Set(raw.ids.filter((id) => typeof id === "string" && id.length > 0))].slice(-CONTEXT_LOG_LIMITS.maxEntries)
+		: [];
+	return { ids };
+}
+
+export function parseContextEntry(raw) {
+	if (!raw || typeof raw !== "object") return null;
+	const id = typeof raw.id === "string" && raw.id.length > 0 ? raw.id : null;
+	const sourceNarratorId = typeof raw.sourceNarratorId === "string" ? raw.sourceNarratorId : null;
+	const text = typeof raw.text === "string" ? raw.text.slice(0, CONTEXT_LOG_LIMITS.maxTextChars).trim() : "";
+	if (!id || !sourceNarratorId || !text) return null;
+	const kind = CONTEXT_KINDS.includes(raw.kind) ? raw.kind : "status";
+	const targetNarratorIds = Array.isArray(raw.targetNarratorIds)
+		? [...new Set(raw.targetNarratorIds.filter((id) => typeof id === "string" && id.length > 0))].slice(0, CONTEXT_LOG_LIMITS.maxTargets)
+		: [];
+	const payload = raw.payload && typeof raw.payload === "object" && !Array.isArray(raw.payload)
+		? Object.fromEntries(
+				Object.entries(raw.payload)
+					.filter(([, value]) => value === null || ["string", "number", "boolean"].includes(typeof value))
+					.slice(0, CONTEXT_LOG_LIMITS.maxPayloadKeys),
+			)
+		: {};
+	return {
+		id,
+		kind,
+		text,
+		payload,
+		sourceNarratorId,
+		targetNarratorIds,
+		createdAt: typeof raw.createdAt === "string" ? raw.createdAt : null,
+	};
+}
+
+export function appendContextIndex(rawIndex, contextId) {
+	const index = parseContextIndex(rawIndex);
+	const ids = [contextId, ...index.ids.filter((id) => id !== contextId)].slice(0, CONTEXT_LOG_LIMITS.maxEntries);
+	return { ids, trimmed: index.ids.filter((id) => !ids.includes(id)) };
+}
+
+export function filterContextEntries(entries, filter = {}) {
+	const kind = typeof filter.kind === "string" ? filter.kind : null;
+	const sourceNarratorId = typeof filter.sourceNarratorId === "string" ? filter.sourceNarratorId : null;
+	const contains = typeof filter.contains === "string" ? filter.contains.trim().toLowerCase() : "";
+	return entries.filter((entry) =>
+		entry &&
+		(!kind || entry.kind === kind) &&
+		(!sourceNarratorId || entry.sourceNarratorId === sourceNarratorId) &&
+		(!contains || entry.text.toLowerCase().includes(contains)),
+	);
 }
 
 // ---------------------------------------------------------------------------
