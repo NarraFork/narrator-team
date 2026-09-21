@@ -21,15 +21,39 @@
 
 ## 安装
 
-插件通过宿主插件系统安装（管理员操作）：
-
-1. 将打包好的 `narrator-team-0.1.49.zip` 放入宿主插件导入目录（`~/.narrafork/plugin-imports/`）；
-2. 在管理员的 Agent 会话中加载工具并用 `PluginInstall` 安装并启用：
+插件通过宿主插件系统安装，**仅管理员可执行**。管理员先加载插件安装工具，之后可以让 Narrator 代为完成安装：
 
 ```
 /load plugin_install
-→ PluginInstall: install_and_enable, path="narrator-team-0.1.49.zip"
 ```
+
+`PluginInstall` 提供四个动作：`list_sources`（列出导入目录中的 `.zip`/`.nfplugin`）、`list_installed`（列出已装插件及版本）、`install`（安装但不启用）、`install_and_enable`（安装并启用）。
+
+包来源有两种，二选一：
+
+### 方式 A：远程 URL（推荐）
+
+把**插件包的直接下载地址**交给 Narrator，由它下载并安装：
+
+```
+PluginInstall: install_and_enable, url="<插件包地址>"
+```
+
+- 只接受公开的 `http`/`https` 地址，带 SSRF 与体积/超时保护；
+- 地址必须直接指向 `.zip`/`.nfplugin` **包本身**。
+
+> **注意**：GitHub 的自动归档地址（形如 `https://github.com/<owner>/<repo>/archive/refs/heads/master.zip`）**不能**用于此处：安装器要求 `manifest.json` 位于压缩包的根目录，而归档会把内容包在一层 `<repo>-<branch>/` 目录下，因此会被拒绝。请改用 Release 附件或其它直接指向包的地址。
+
+### 方式 B：本地包文件
+
+1. 将打包好的 `narrator-team-0.1.49.zip` 放入宿主插件导入目录（`~/.narrafork/plugin-imports/`）；
+2. 让 Narrator 安装：
+
+```
+PluginInstall: install_and_enable, path="narrator-team-0.1.49.zip"
+```
+
+安装新版本会升级已装插件并保留其授权，但升级后需要重新启用才会运行。
 
 安装后插件贡献以下入口：
 
