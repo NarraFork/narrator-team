@@ -6,6 +6,7 @@
 
 - 当前版本：`0.1.49`
 - 运行方式：local-process 插件（宿主 NarraFork 0.7.7+，公共 API 含 narrator 通道）
+- 仓库：<https://github.com/NarraFork/narrator-team>（MIT）
 
 ## 功能特性
 
@@ -16,7 +17,7 @@
 - **临时工（temp）** — 任意成员可招募 `role=temp` 的 subagent 临时工协助大任务拆分，完成后可随时 `team.fire` 解雇，保持团队精简
 - **成员资料管理** — `team.update_member` 修改成员名称（title）、模型（model）、思考强度（reasoningEffort）与 Dynamic Spec 文件
 - **Worker 计划自动审查** — 派发前为 worker 开启宿主的计划反思自动批准；先审查计划，确认后继续执行，不绕过宿主安全检查
-- **UI 面板** — 插件面板支持团队切换、成员编辑（标题/模型/思考强度）、成员添加、任务队列查看与删除（行内 ✕ 或右键）
+- **UI 面板** — 团队切换、Leader 设置（行式 ★ 切换）、成员添加与**移出团队**、成员资料编辑（标题/模型/思考强度）、任务队列查看与删除（行内 ✕ 或右键）；成员状态与消息数自动刷新
 
 ## 安装
 
@@ -65,11 +66,13 @@
 
 插件声明的最小宿主能力（见 `manifest.json`）：
 
-- 读取：`query.read.narrators` / `query.read.projects` / `query.read.chapters` / `query.read.narrator_context_delivery`
-- 叙述者命令：`narrator.context_broadcast` / `send_message` / `send_subagent_message` / `interrupt` / `create` / `delete` / `spec_tasks_get` / `spec_task_add` / `update_profile` / `spec_write`
-- 其他：`event.subscribe`、`storage.read_self` / `write_self`、`ui.panel`、`provider.use`
+- 读取：`query.read.narrators` / `query.read.projects` / `query.read.chapters`
+- 叙述者命令（`command.narrator.*`）：`send_message` / `send_subagent_message` / `interrupt` / `create` / `delete` / `spec_tasks_get` / `spec_task_add` / `spec_behavior_fence_update` / `update_profile` / `spec_write`
+- 其他：`event.subscribe`、`storage.read_self` / `storage.write_self`、`ui.panel`、`provider.use`
 
-网络与文件系统默认收紧：`network.mode = none`，仅包内只读 + 插件数据可写。
+网络与文件系统默认收紧：`network.mode = none`，`filesystem` 仅包内只读 + 插件数据可写，`process.spawn = none`。
+
+> 注：早期版本中的 `query.read.narrator_context_delivery` 与 `command.narrator.context_broadcast` 已随宿主要求变更移除，`team.context_broadcast` 现经 `send_message` / `send_subagent_message` 投递。
 
 ## 开发
 
