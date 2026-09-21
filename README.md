@@ -42,7 +42,15 @@ PluginInstall: install_and_enable, url="<插件包地址>"
 - 只接受公开的 `http`/`https` 地址，带 SSRF 与体积/超时保护；
 - 地址必须直接指向 `.zip`/`.nfplugin` **包本身**。
 
-> **注意**：GitHub 的自动归档地址（形如 `https://github.com/<owner>/<repo>/archive/refs/heads/master.zip`）**不能**用于此处：安装器要求 `manifest.json` 位于压缩包的根目录，而归档会把内容包在一层 `<repo>-<branch>/` 目录下，因此会被拒绝。请改用 Release 附件或其它直接指向包的地址。
+推荐直接用本仓库的 Release 附件（由 CI 在推送 `v*` tag 时自动构建并附带）：
+
+```
+PluginInstall: install_and_enable, url="https://github.com/NarraFork/narrator-team/releases/download/v0.1.49/narrator-team-0.1.49.zip"
+```
+
+> **注意**：GitHub 的自动归档地址（形如 `https://github.com/<owner>/<repo>/archive/refs/heads/master.zip`）**不能**用于此处：安装器要求 `manifest.json` 位于压缩包的根目录，而归档会把内容包在一层 `<repo>-<branch>/` 目录下，因此会被拒绝。Release 附件不存在这个问题。
+
+> **注意**：同一 `pluginId@version` 在宿主内只允许保留一个包。若本地已用同版本的其它构建安装过，从 URL 装同一版本会因 hash 不同被拒；发版时请以 CI 产物为准，或递增版本号。
 
 ### 方式 B：本地包文件
 
@@ -109,7 +117,19 @@ bun test
 ```
 
 - 版本号：同步更新 `manifest.json` 与 `scripts/package.mjs` 中的 `VERSION`
-- 打包内容：`server/`、`ui/`、`manifest.json` 等，自动排除 `tests/` 与 `scripts/`
+- 打包内容：`server/`、`ui/`、`manifest.json` 等，自动排除 `tests/`、`scripts/` 与 `.github/`
+
+### 发版
+
+推送 `v*` tag 即可：`.github/workflows/release.yml` 会校验 tag 与 `manifest.json` 版本一致、按上述规则打包，并把 zip 作为 Release 附件上传，供 `PluginInstall` 的 `url` 使用。
+
+```bash
+# 先递增 manifest.json 与 scripts/package.mjs 的版本号并提交
+git tag -a v0.1.50 -m "narrator-team 0.1.50"
+git push origin v0.1.50
+```
+
+CI 产出的包应作为该版本唯一的安装来源——本地另建的同一个版本 hash 不同，会与它冲突。
 
 ## License
 
