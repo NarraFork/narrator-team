@@ -38,7 +38,7 @@ const VERSION = "0.1.49";
 const files = [];
 (function walk(dir) {
 	for (const name of readdirSync(dir)) {
-		if (name === "tests" || name === "scripts" || name === ".git") continue;
+		if (name === "tests" || name === "scripts" || name === ".git" || name === ".github") continue;
 		const absolute = join(dir, name);
 		const relative = absolute.slice(ROOT.length + 1).replaceAll("\\", "/");
 		if (statSync(absolute).isDirectory()) {

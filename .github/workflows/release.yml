@@ -1,0 +1,56 @@
+name: Release
+
+# Publishes the installable plugin package so it can be installed by URL:
+#   PluginInstall: install_and_enable, url="<release asset url>"
+#
+# The asset is what makes URL installation possible at all: GitHub's automatic
+# source archives (…/archive/refs/tags/vX.zip) wrap everything in a
+# `<repo>-<tag>/` folder, while the host requires `manifest.json` at the archive
+# ROOT (it reads `packageRoot/manifest.json`). Zip the entries explicitly so no
+# top-level directory is introduced.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches the manifest version
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          manifest_version="$(jq -r .version manifest.json)"
+          if [ "$tag_version" != "$manifest_version" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match manifest.json version $manifest_version" >&2
+            exit 1
+          fi
+
+      - name: Build plugin package
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          package="narrator-team-${version}.zip"
+          # Mirrors scripts/package.mjs, which walks the repo and skips tests/,
+          # scripts/ and .git/. Keep the two in step.
+          zip -r "$package" \
+            manifest.json server ui README.md LICENSE sbom.spdx.json
+          # Guard the layout the installer depends on: manifest.json must be an
+          # exact root entry, not nested under a directory.
+          unzip -Z1 "$package" | grep -qx 'manifest\.json'
+          echo "package=$package" >> "$GITHUB_ENV"
+
+      - name: Create release with the package attached
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" "$package" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
