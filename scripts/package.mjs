@@ -33,7 +33,7 @@ async function loadArchiver() {
 }
 
 const ROOT = resolve(import.meta.dir, "..");
-const VERSION = "0.1.45";
+const VERSION = "0.1.49";
 
 const files = [];
 (function walk(dir) {

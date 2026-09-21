@@ -335,7 +335,7 @@ beforeAll(async () => {
 	});
 	const binding = hostServices.bindRuntime({
 		pluginId: PLUGIN_ID,
-		packageVersion: "0.1.45",
+		packageVersion: "0.1.49",
 		installationId: "installation-e2e",
 		runtimeId: "runtime-e2e",
 		runtimeGeneration: 1,
@@ -350,7 +350,7 @@ beforeAll(async () => {
 	// Spawn the actual plugin process and wire its host-facing dispatcher.
 	pluginRuntime = new PluginRuntime({
 		pluginId: PLUGIN_ID,
-		pluginVersion: "0.1.45",
+		pluginVersion: "0.1.49",
 		installationId: "installation-e2e",
 		runtimeId: "runtime-e2e",
 		command: [process.execPath, join(PLUGIN_ROOT, "server/index.js")],

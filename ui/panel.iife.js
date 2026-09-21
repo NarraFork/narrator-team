@@ -52,11 +52,14 @@
 		messageTarget: null,
 		// Member profile editor: { teamId, memberId, name } when open.
 		editTarget: null,
-		// Task deletion confirm: { team, task } when open. Uses an in-panel DOM
-		// modal because the plugin iframe runs sandbox="allow-scripts" only, and
-		// window.confirm() is silently rejected without allow-modals.
-		deleteTarget: null,
-	};
+	// Task deletion confirm: { team, task } when open. Uses an in-panel DOM
+	// modal because the plugin iframe runs sandbox="allow-scripts" only, and
+	// window.confirm() is silently rejected without allow-modals.
+	deleteTarget: null,
+	// Member removal confirm: { teamId, memberId, name } when open (same modal
+	// constraint as deleteTarget).
+	removeMemberTarget: null,
+};
 
 	// The last successfully loaded view is persisted under the plugin's own
 	// storage so the next open paints instantly from cache, then refreshes
@@ -382,7 +385,9 @@
 	async function saveViewCache() {
 		if (!state.currentNarratorId) return;
 		const now = Date.now();
-		if (now - lastCacheSaveAt < 3_000) return; // throttle bursty event refreshes
+		// Longer than the refresh heartbeat, so the periodic safety-net refresh
+		// does not turn into a view-cache write on every tick.
+		if (now - lastCacheSaveAt < 10_000) return;
 		lastCacheSaveAt = now;
 		try {
 			await request("storage.set", {
@@ -532,6 +537,20 @@
 		lastSubscribedIds = null;
 	}
 
+	/**
+	 * Read the events out of an `events.poll` response.
+	 *
+	 * The host returns a BARE ARRAY of events here; only `queries.execute` /
+	 * `commands.execute` wrap their payload in a `{ status, data }` envelope.
+	 * Reading `result.events` therefore always produced nothing, which is why the
+	 * panel silently never auto-refreshed.
+	 */
+	function readPolledEvents(result) {
+		if (Array.isArray(result)) return result;
+		if (result && typeof result === "object" && Array.isArray(result.events)) return result.events;
+		return [];
+	}
+
 	async function pollEvents() {
 		if (!eventSubscriptionId || eventPollInFlight) return;
 		eventPollInFlight = true;
@@ -540,8 +559,7 @@
 				subscriptionId: eventSubscriptionId,
 				limit: 100,
 			});
-			const events = result && Array.isArray(result.events) ? result.events : [];
-			if (events.length > 0) scheduleRefresh();
+			if (readPolledEvents(result).length > 0) scheduleRefresh();
 		} catch {
 			// transient poll failure: try again next tick
 		} finally {
@@ -553,8 +571,49 @@
 	function scheduleRefresh() {
 		clearTimeout(refreshTimer);
 		refreshTimer = setTimeout(() => {
-			refresh();
+			if (canRefreshQuietly()) refresh();
 		}, 500);
+	}
+
+	// ------------------------------------------------------- refresh heartbeat
+	// Events carry the narrators' status transitions, but subscriptions are
+	// best-effort (they can be revoked, overflow, or fail during the bridge
+	// handshake) — and a leader watching a team must not depend on that working
+	// perfectly. A low-frequency heartbeat keeps status/message counts live even
+	// when no event ever arrives. Kept slower than the event poll so the event
+	// path stays the fast one.
+	const REFRESH_HEARTBEAT_MS = 8_000;
+	let heartbeatTimer = null;
+
+	/**
+	 * Whether refreshing now would disturb the user. `render()` rebuilds the DOM,
+	 * so a refresh landing mid-typing would drop the caret, and one landing on an
+	 * open modal would reset its scroll. Skipping is cheap: the next tick picks
+	 * the update up.
+	 */
+	function canRefreshQuietly() {
+		if (typeof document === "undefined") return true;
+		if (document.hidden) return false;
+		if (state.pickerOpen || state.messageTarget || state.editTarget || state.deleteTarget || state.removeMemberTarget) {
+			return false;
+		}
+		const active = document.activeElement;
+		if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA")) return false;
+		return true;
+	}
+
+	function startRefreshHeartbeat() {
+		if (heartbeatTimer) return;
+		heartbeatTimer = setInterval(() => {
+			if (canRefreshQuietly()) refresh();
+		}, REFRESH_HEARTBEAT_MS);
+		// Returning to the panel should show live data immediately, not after the
+		// next tick.
+		if (typeof document !== "undefined") {
+			document.addEventListener("visibilitychange", () => {
+				if (!document.hidden && canRefreshQuietly()) refresh();
+			});
+		}
 	}
 
 	// ---------------------------------------------------------------- actions
@@ -693,20 +752,37 @@
 
 	let autoSaveTimer = null;
 
-	/** Debounced auto-save for the team config form (name / leader changes). */
-	function scheduleAutoSave(patch) {
+	/**
+	 * Debounced auto-save for the team config form (name / leader changes).
+	 *
+	 * The patch is applied to local state immediately so the write stays
+	 * debounced (typing a name must not fire one request per keystroke) while the
+	 * UI can still react at once. Callers that want the change painted right away
+	 * pass `rerender: true` — the name field deliberately omits it, because
+	 * rebuilding the form would drop the caret mid-typing.
+	 */
+	function scheduleAutoSave(patch, options = {}) {
 		const team = activeTeam();
 		if (!team) return;
+		const idx = state.teams.findIndex((t) => t.id === team.id);
+		const previous = idx >= 0 ? state.teams[idx] : null;
+		if (idx >= 0) {
+			state.teams[idx] = { ...state.teams[idx], ...patch, updatedAt: new Date().toISOString() };
+		}
+		if (options.rerender) render();
 		clearTimeout(autoSaveTimer);
 		autoSaveTimer = setTimeout(async () => {
-			const next = { ...team, ...patch, updatedAt: new Date().toISOString() };
+			const current = activeTeam();
+			if (!current) return;
+			const next = { ...current, updatedAt: new Date().toISOString() };
 			delete next.tasks;
 			try {
-				await request("storage.set", { scope: { type: "global" }, key: teamConfigKey(team.id), value: next });
-				// Update local state in place so the form keeps focus; no full refresh.
-				const idx = state.teams.findIndex((t) => t.id === team.id);
-				if (idx >= 0) state.teams[idx] = { ...state.teams[idx], ...patch, updatedAt: next.updatedAt };
+				await request("storage.set", { scope: { type: "global" }, key: teamConfigKey(current.id), value: next });
 			} catch (error) {
+				// The patch was applied optimistically, so undo it — the panel must
+				// never keep showing a change that was not actually persisted.
+				const revertIdx = state.teams.findIndex((t) => t.id === team.id);
+				if (revertIdx >= 0 && previous) state.teams[revertIdx] = previous;
 				state.notice = `自动保存失败：${error instanceof Error ? error.message : String(error)}`;
 				render();
 			}
@@ -722,28 +798,47 @@
 			placeholder: "团队名称",
 			oninput: (e) => scheduleAutoSave({ name: e.target.value.trim() }),
 		});
-		const leaderSelect = el("select", {
-			multiple: "multiple",
-			size: Math.min(Math.max(state.narrators.length, 3), 8),
-			onchange: (e) =>
-				scheduleAutoSave({
-					leaderIds: Array.from(e.target.selectedOptions, (option) => option.value),
-				}),
-		});
 		const leaderIds = team.leaderIds ?? (team.leaderId ? [team.leaderId] : []);
-		for (const narrator of state.narrators) {
-			const option = el("option", {
-				value: narrator.id,
-				text: `${narratorLabel(narrator)}（${narrator.id}）`,
-			});
-			if (leaderIds.includes(narrator.id)) option.selected = true;
-			leaderSelect.appendChild(option);
-		}
+		// Inline leader editor. This used to be a native <select multiple>, which
+		// rendered as an OS listbox unlike anything else in the panel and forced
+		// every option to carry its raw narrator id. Reuse the picker's row design
+		// so the ★ toggle means the same thing in both places, and keep the id out
+		// of the label.
+		const leaderRows = state.narrators.map((narrator) => {
+			const isLeader = leaderIds.includes(narrator.id);
+			const accent = PICKER_STATUS[narrator.status ?? "idle"] ?? PICKER_STATUS.idle;
+			return el("div", {
+				class: `nt-narrator-row${isLeader ? " nt-row-selected" : ""}`,
+				onclick: () => toggleConfigLeader(narrator.id),
+			}, [
+				el("span", {
+					class: "nt-narrator-dot",
+					style: `background: var(--mantine-color-${accent.color}-${accent.shade})`,
+				}),
+				el("div", { class: "nt-narrator-main" }, [
+					el("div", { class: "nt-narrator-title", text: narratorLabel(narrator) }),
+					el("div", {
+						class: "nt-narrator-sub",
+						text: `${narrator.model ?? "default model"} · ${narrator.messageCount ?? 0} msgs`,
+					}),
+				]),
+				el("button", {
+					class: `nt-leader-mark${isLeader ? " nt-leader-active" : ""}`,
+					text: "★",
+					title: isLeader ? "取消 Leader" : "设为 Leader",
+					onclick: (e) => { e.stopPropagation(); toggleConfigLeader(narrator.id); },
+				}),
+			]);
+		});
 
 		return section("团队配置", el("div", { class: "nt-form" }, [
 			el("label", { text: "名称" }), nameInput,
-			el("label", { text: "Leaders（可多选）" }), leaderSelect,
-			el("span", { class: "nt-empty", text: "名称与 Leader 修改后自动保存；按 Ctrl/Cmd 可多选" }),
+			el("label", { text: "Leaders（可多选）" }),
+			el("div", { class: "nt-leader-list" },
+				leaderRows.length
+					? leaderRows
+					: [el("span", { class: "nt-empty", text: "没有可用的叙述者" })]),
+			el("span", { class: "nt-empty", text: "名称与 Leader 修改后自动保存；点击 ★ 切换 Leader" }),
 		]));
 	}
 
@@ -839,6 +934,16 @@
 					title: `打开 ${label} 的聊天页`,
 					onclick: () => openNarrator(id),
 				}, "↗"),
+				// Remove from the team (membership only — the narrator itself is
+				// untouched, so this is recoverable by re-adding it below).
+				el("button", {
+					class: "nt-chip-icon nt-chip-icon-danger",
+					title: `将 ${label} 移出团队`,
+					onclick: () => {
+						state.removeMemberTarget = { teamId: team.id, memberId: id, name: label };
+						render();
+					},
+				}, "✕"),
 			]);
 		});
 		return el("div", { class: "nt-cards" }, chips);
@@ -1116,13 +1221,66 @@
 		await saveTeamConfig(team.name, state.pickerLeaders, members);
 	}
 
-	/** Remove a member; removing a Leader also clears that Leader assignment. */
-	async function deleteMember(id) {
-		const team = activeTeam();
+	/**
+	 * Remove a member from the team. This only edits the team roster — the
+	 * narrator itself is left running, so the action is recoverable by re-adding
+	 * it (unlike team.fire, which deletes the narrator). Removing a Leader also
+	 * clears that Leader assignment, mirroring the backend's own rule.
+	 */
+	async function deleteMember(teamId, memberId) {
+		const team = state.teams.find((t) => t.id === teamId);
 		if (!team) return;
-		const members = team.members.filter((member) => member !== id);
-		const leaderIds = (team.leaderIds ?? (team.leaderId ? [team.leaderId] : [])).filter((leaderId) => leaderId !== id);
+		const members = team.members.filter((member) => member !== memberId);
+		const leaderIds = (team.leaderIds ?? (team.leaderId ? [team.leaderId] : [])).filter(
+			(leaderId) => leaderId !== memberId,
+		);
 		await saveTeamConfig(team.name, leaderIds, members);
+	}
+
+	function closeRemoveMember() {
+		state.removeMemberTarget = null;
+		render();
+	}
+
+	function renderRemoveMemberModal() {
+		const target = state.removeMemberTarget;
+		if (!target) return null;
+		const team = state.teams.find((t) => t.id === target.teamId);
+		const leaderIds = team ? (team.leaderIds ?? (team.leaderId ? [team.leaderId] : [])) : [];
+		const isLeader = leaderIds.includes(target.memberId);
+		const remove = el("button", {
+			class: "nt-btn nt-btn-danger",
+			text: "移出团队",
+			onclick: async () => {
+				remove.disabled = true;
+				state.removeMemberTarget = null;
+				await deleteMember(target.teamId, target.memberId);
+			},
+		});
+		return el("div", {
+			class: "nt-modal-overlay",
+			onclick: (e) => { if (e.target === e.currentTarget) closeRemoveMember(); },
+		}, [
+			el("div", { class: "nt-modal nt-modal-narrow" }, [
+				el("div", { class: "nt-modal-header" }, [
+					el("h3", { text: "移出团队" }),
+					el("button", { class: "nt-modal-close", text: "✕", onclick: closeRemoveMember }),
+				]),
+				el("div", { class: "nt-modal-list" }, [
+					el("p", { text: `确定将「${target.name}」移出团队？` }),
+					el("p", {
+						class: "nt-empty",
+						text: isLeader
+							? "该成员当前是 Leader，移出后同时取消其 Leader 身份。"
+							: "该叙述者本身不会被删除，之后可以重新添加回团队。",
+					}),
+				]),
+				el("div", { class: "nt-modal-footer" }, [
+					el("button", { class: "nt-btn nt-btn-outline", text: "取消", onclick: closeRemoveMember }),
+					remove,
+				]),
+			]),
+		]);
 	}
 
 	/** Toggle a Leader in the multi-select picker. */
@@ -1133,6 +1291,26 @@
 		// Every Leader is also a member: auto-select it in the picker.
 		if (!state.pickerSelected.includes(id)) state.pickerSelected.push(id);
 		render();
+	}
+
+	/**
+	 * Toggle a Leader from the inline config form. Unlike the picker this saves
+	 * immediately (the form auto-saves), and it keeps the "every Leader is also a
+	 * member" invariant the backend relies on. Un-marking a Leader leaves it as a
+	 * member, matching the picker's behaviour.
+	 */
+	function toggleConfigLeader(id) {
+		const team = activeTeam();
+		if (!team) return;
+		const current = team.leaderIds ?? (team.leaderId ? [team.leaderId] : []);
+		const leaderIds = current.includes(id)
+			? current.filter((leaderId) => leaderId !== id)
+			: [...current, id];
+		const members = leaderIds.includes(id) && !team.members.includes(id)
+			? [...team.members, id]
+			: team.members;
+		// Keep the legacy single-value field in sync the same way saveTeamConfig does.
+		scheduleAutoSave({ leaderIds, leaderId: leaderIds[0] ?? null, members }, { rerender: true });
 	}
 
 	// 状态点色阶与宿主 status-registry 一致：idle=gray/working=blue/
@@ -1207,7 +1385,28 @@
 		]);
 	}
 
+	/**
+	 * Paint the panel, preserving the scroll position across the DOM rebuild.
+	 *
+	 * Clearing the root momentarily empties the panel, which lets the scroll
+	 * container clamp to the top — so a background refresh would yank a scrolled
+	 * panel back to the start. The restore lives in `finally` so the early
+	 * returns (loading / no narrator) keep it too.
+	 */
 	function render() {
+		const scroller =
+			typeof document === "undefined"
+				? null
+				: (document.scrollingElement ?? document.documentElement);
+		const scrollTop = scroller ? scroller.scrollTop : 0;
+		try {
+			renderContent();
+		} finally {
+			if (scroller && scroller.scrollTop !== scrollTop) scroller.scrollTop = scrollTop;
+		}
+	}
+
+	function renderContent() {
 		root.textContent = "";
 		const header = el("div", { class: "nt-header" }, [
 			el("h1", { text: "Narrator Team" }),
@@ -1295,11 +1494,14 @@
 		if (editModal) root.appendChild(editModal);
 		const deleteModal = renderDeleteConfirmModal();
 		if (deleteModal) root.appendChild(deleteModal);
+		const removeModal = renderRemoveMemberModal();
+		if (removeModal) root.appendChild(removeModal);
 	}
 
 	// ------------------------------------------------------------------ boot
 	root.className = "nt-root";
 	render();
+	startRefreshHeartbeat();
 	// Defer the first data load: the host UI bridge finishes its handshake after
 	// this script runs, so an immediate burst of requests can race it. A short
 	// delay keeps the first paint instant and the requests serialized behind

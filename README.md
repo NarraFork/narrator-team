@@ -4,8 +4,8 @@
 
 > **测试性声明**：这是一个**测试性**的 NarraFork 插件，用于验证宿主插件系统与团队协作工作流；在未来可能会**并入 NarraFork 本体**。
 
-- 当前版本：`0.1.45`
-- 运行方式：local-process 插件（宿主 NarraFork 0.5.23+，公共 API 含 narrator 通道）
+- 当前版本：`0.1.49`
+- 运行方式：local-process 插件（宿主 NarraFork 0.7.7+，公共 API 含 narrator 通道）
 
 ## 功能特性
 
@@ -22,12 +22,12 @@
 
 插件通过宿主插件系统安装（管理员操作）：
 
-1. 将打包好的 `narrator-team-0.1.45.zip` 放入宿主插件导入目录（`~/.narrafork/plugin-imports/`）；
+1. 将打包好的 `narrator-team-0.1.49.zip` 放入宿主插件导入目录（`~/.narrafork/plugin-imports/`）；
 2. 在管理员的 Agent 会话中加载工具并用 `PluginInstall` 安装并启用：
 
 ```
 /load plugin_install
-→ PluginInstall: install_and_enable, path="narrator-team-0.1.45.zip"
+→ PluginInstall: install_and_enable, path="narrator-team-0.1.49.zip"
 ```
 
 安装后插件贡献以下入口：

@@ -1,7 +1,7 @@
 {
 	"schemaVersion": 1,
 	"pluginId": "com.whisent.narrator-team",
-	"version": "0.1.45",
+	"version": "0.1.49",
 	"displayName": "Narrator Team",
 	"description": "组织一个 Leader Narrator 与多个 Worker Narrator 的团队：Leader 可在会话内派发任务给成员，支持 UI 面板配置团队、查看成员状态与任务队列。",
 	"publisher": {

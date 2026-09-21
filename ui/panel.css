@@ -12,6 +12,11 @@
 	box-sizing: border-box;
 	font-size: var(--mantine-font-size-sm, 13px);
 	line-height: var(--mantine-line-height, 1.55);
+	/* Long unbreakable tokens (narrator / task ids) would otherwise widen the
+	 * panel past its viewport and produce a horizontal scrollbar. Belt-and-braces
+	 * with the per-element fixes below. */
+	overflow-x: hidden;
+	min-width: 0;
 }
 
 .nt-header {
@@ -160,6 +165,37 @@
 	display: flex;
 	flex-direction: column;
 	gap: var(--mantine-spacing-xs, 6px);
+	min-width: 0;
+}
+
+/* Team heading. These had no rules at all, so the raw team id sat on one
+ * unwrapped line and pushed the panel wider than its viewport. */
+.nt-team {
+	min-width: 0;
+}
+
+.nt-team-head {
+	display: flex;
+	align-items: baseline;
+	flex-wrap: wrap;
+	gap: 6px;
+	min-width: 0;
+}
+
+.nt-title-inline {
+	margin: 0;
+	border-bottom: none;
+	padding-bottom: 0;
+	min-width: 0;
+	overflow-wrap: anywhere;
+}
+
+.nt-team-id {
+	font-size: var(--mantine-font-size-xs, 11px);
+	color: var(--mantine-color-dimmed, #868e96);
+	font-family: var(--mantine-font-family-monospace, ui-monospace, monospace);
+	overflow-wrap: anywhere;
+	min-width: 0;
 }
 
 .nt-tasks {
@@ -409,8 +445,28 @@
 	border-color: var(--mantine-color-default-border, #3d3f45);
 }
 
+/* Remove-from-team affordance: reads destructive on hover, unlike the neutral
+ * interrupt / message / edit icons next to it. */
+.nt-chip-icon-danger:hover {
+	background: var(--mantine-color-red-9, #3b1b1e);
+	color: var(--mantine-color-red-5, #fa5252);
+	border-color: var(--mantine-color-red-7, #e03131);
+}
+
 .nt-modal-narrow {
 	width: min(400px, calc(100vw - 32px));
+}
+
+/* ---- inline leader editor (config form) ---- */
+.nt-leader-list {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	max-height: 220px;
+	overflow-y: auto;
+	border: 1px solid var(--mantine-color-default-border, #373a40);
+	border-radius: var(--mantine-radius-sm, 4px);
+	padding: var(--mantine-spacing-xs, 6px);
 }
 
 /* ---- leader mark (★ single-select in the picker) ---- */
@@ -453,17 +509,24 @@
 	flex-wrap: wrap;
 	gap: 6px;
 	align-items: center;
+	/* Flex items default to min-width:auto, so an unbreakable id below would
+	 * refuse to shrink and widen the whole panel. */
+	min-width: 0;
 }
 
 .nt-task-id {
 	font-size: var(--mantine-font-size-xs, 11px);
 	color: var(--mantine-color-dimmed, #909296);
 	font-family: var(--mantine-font-family-monospace, ui-monospace, monospace);
+	min-width: 0;
+	overflow-wrap: anywhere;
 }
 
 .nt-task-member {
 	font-size: var(--mantine-font-size-xs, 11px);
 	color: var(--mantine-color-dimmed, #adb5bd);
+	min-width: 0;
+	overflow-wrap: anywhere;
 }
 
 .nt-task-prompt {
