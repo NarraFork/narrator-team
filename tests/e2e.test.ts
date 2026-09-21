@@ -396,6 +396,9 @@ describe("narrator-team end-to-end", () => {
 	// Shared between the ordered tests below (bun runs them in file order).
 	let teamAId = "";
 	let teamBId = "";
+	// Team used by the shared-context tests (kept separate: the team-A fixtures
+	// are mutated by the queue/report tests above).
+	let ctxTeamId = "";
 
 	/** Helper: invoke a contribution with an optional calling narrator. */
 	function invoke(contributionId, input, narratorId) {
@@ -955,5 +958,127 @@ describe("narrator-team end-to-end", () => {
 		expect(view.ok).toBe(true);
 		expect(view.teams).toHaveLength(51); // Team B + 50 paged teams
 		expect(view.teams.some((team) => team.name === "Paged Team 49")).toBe(true);
+	});
+
+	test("team.context_broadcast hands context off as a message, not a task", async () => {
+		seedPagedNarrator("ctx-leader", "Context Leader");
+		seedPagedNarrator("ctx-worker", "Context Worker");
+		const setup = JSON.parse(
+			(
+				await invoke(
+					"team.setup",
+					{ name: "Context Team", leaderId: "ctx-leader", members: ["ctx-worker"] },
+					"ctx-leader",
+				)
+			).output,
+		);
+		expect(setup.ok).toBe(true);
+		ctxTeamId = setup.teamId;
+		const before = sent.length;
+
+		const result = JSON.parse(
+			(
+				await invoke(
+					"team.context_broadcast",
+					{
+						teamId: ctxTeamId,
+						contextId: "ctx-e2e-1",
+						kind: "fact",
+						text: "Entry point is server/lib/rpc.js",
+						payload: { file: "server/lib/rpc.js" },
+						targetNarratorIds: ["ctx-worker"],
+					},
+					"ctx-leader",
+				)
+			).output,
+		);
+
+		// NarraFork 0.7.7 exposes no plugin-facing structured context channel, so
+		// the record must travel as an ordinary message and the receipt is kept
+		// plugin-side instead of being handed back by the host.
+		expect(result).toMatchObject({ ok: true, status: "delivered", delivered: 1, failed: [] });
+
+		expect(sent.length).toBe(before + 1);
+		expect(sent[sent.length - 1].narratorId).toBe("ctx-worker");
+		const handoff = sent[sent.length - 1].prompt;
+		expect(handoff).toContain("[团队上下文 ctx-e2e-1（fact）]");
+		expect(handoff).toContain("Entry point is server/lib/rpc.js");
+		expect(handoff).toContain("- file: server/lib/rpc.js");
+		// A handoff is information, not a closable team task.
+		expect(handoff).not.toContain("[团队任务 ");
+
+		// The receipt is persisted next to the entry it describes, including the
+		// message id the host returned for the delivery.
+		const receipt = readStored(`team.${ctxTeamId}.contexts.ctx-e2e-1.deliveries`);
+		expect(receipt.items).toEqual([
+			{ narratorId: "ctx-worker", status: "delivered", messageId: expect.any(String), error: null },
+		]);
+	});
+
+	test("team.context_broadcast is idempotent and team.context_log lists the handoff", async () => {
+		const before = sent.length;
+		const again = JSON.parse(
+			(
+				await invoke(
+					"team.context_broadcast",
+					{
+						teamId: ctxTeamId,
+						contextId: "ctx-e2e-1",
+						kind: "fact",
+						text: "Entry point is server/lib/rpc.js",
+						payload: { file: "server/lib/rpc.js" },
+						targetNarratorIds: ["ctx-worker"],
+					},
+					"ctx-leader",
+				)
+			).output,
+		);
+		expect(again.status).toBe("already_pending");
+		expect(again.receipt).toMatchObject({ total: 1, delivered: 1, failed: [] });
+		expect(sent.length).toBe(before); // no duplicate delivery
+
+		const log = JSON.parse(
+			(await invoke("team.context_log", { teamId: ctxTeamId, kind: "fact" }, "ctx-worker")).output,
+		);
+		expect(log.ok).toBe(true);
+		expect(log.entries).toHaveLength(1);
+		expect(log.entries[0]).toMatchObject({
+			id: "ctx-e2e-1",
+			kind: "fact",
+			sourceNarratorId: "ctx-leader",
+			targetNarratorIds: ["ctx-worker"],
+		});
+	});
+
+	test("team.context_broadcast reaches a subagent target via the subagent channel", async () => {
+		const recruited = JSON.parse(
+			(
+				await invoke("team.recruit", { teamId: ctxTeamId, role: "temp", title: "Ctx Temp" }, "ctx-worker")
+			).output,
+		);
+		expect(recruited.ok).toBe(true);
+		const before = subagentSent.length;
+
+		const result = JSON.parse(
+			(
+				await invoke(
+					"team.context_broadcast",
+					{
+						teamId: ctxTeamId,
+						contextId: "ctx-e2e-2",
+						kind: "instruction",
+						text: "Regenerate the RPC frame tests",
+						targetNarratorIds: [recruited.memberId],
+					},
+					"ctx-leader",
+				)
+			).output,
+		);
+
+		// Subagents have no direct channel; the handoff must go out via
+		// send_subagent_message, not send_message.
+		expect(result).toMatchObject({ ok: true, delivered: 1, failed: [] });
+		expect(subagentSent.length).toBe(before + 1);
+		expect(subagentSent[subagentSent.length - 1].message).toContain("[团队上下文 ctx-e2e-2（instruction）]");
 	});
 });

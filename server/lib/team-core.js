@@ -877,6 +877,87 @@ export function filterContextEntries(entries, filter = {}) {
 	);
 }
 
+/** Per-target outcome of one context broadcast. */
+export const CONTEXT_DELIVERY_STATUSES = Object.freeze(["delivered", "failed", "pending"]);
+
+/**
+ * Compose the member-facing message for a shared context record.
+ *
+ * The marker is deliberately distinct from `TEAM_TASK_MARKER`: a context
+ * handoff is information, not an assignment, so it must not read as a task the
+ * worker has to close with `team.report`. Keeping the two markers apart is what
+ * lets the SOP's task-source rule stay unambiguous.
+ */
+export function contextPrompt(entry) {
+	const payloadLines = Object.entries(entry.payload ?? {})
+		.map(([key, value]) => `- ${key}: ${value}`)
+		.join("\n");
+	return [
+		`[团队上下文 ${entry.id}（${entry.kind}）] 来自 ${entry.sourceNarratorId}：`,
+		entry.text,
+		...(payloadLines ? ["", "附加信息：", payloadLines] : []),
+	].join("\n");
+}
+
+/**
+ * Whether two context records carry the same handoff content.
+ *
+ * `createdAt` is deliberately excluded: it records when the handoff was first
+ * stored, so a retry that re-sends the same record would otherwise be rejected
+ * as a conflict purely because the clock moved — making the idempotent
+ * "already delivered" path unreachable in practice.
+ */
+export function sameContextContent(a, b) {
+	if (!a || !b) return false;
+	return (
+		a.id === b.id &&
+		a.kind === b.kind &&
+		a.text === b.text &&
+		a.sourceNarratorId === b.sourceNarratorId &&
+		JSON.stringify(a.payload) === JSON.stringify(b.payload) &&
+		JSON.stringify(a.targetNarratorIds) === JSON.stringify(b.targetNarratorIds)
+	);
+}
+
+/**
+ * Normalize a persisted delivery receipt for one context record. Bounded like
+ * every other stored record so a malformed row can never grow the response.
+ */export function parseContextDeliveries(raw) {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+		return { contextId: null, updatedAt: null, items: [] };
+	}
+	const items = Array.isArray(raw.items)
+		? raw.items
+				.slice(0, CONTEXT_LOG_LIMITS.maxTargets)
+				.map((item) => ({
+					narratorId: typeof item?.narratorId === "string" ? item.narratorId : null,
+					status: CONTEXT_DELIVERY_STATUSES.includes(item?.status) ? item.status : "failed",
+					messageId: typeof item?.messageId === "string" ? item.messageId : null,
+					error: typeof item?.error === "string" ? item.error.slice(0, 500) : null,
+				}))
+				.filter((item) => item.narratorId !== null)
+		: [];
+	return {
+		contextId: typeof raw.contextId === "string" ? raw.contextId : null,
+		updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : null,
+		items,
+	};
+}
+
+/**
+ * Summarize a delivery receipt for tool output: counts per status plus the
+ * narrators that failed, which is what the Leader needs to act on.
+ */
+export function summarizeDeliveries(deliveries) {
+	const items = Array.isArray(deliveries?.items) ? deliveries.items : [];
+	return {
+		total: items.length,
+		delivered: items.filter((item) => item.status === "delivered").length,
+		failed: items.filter((item) => item.status === "failed").map((item) => item.narratorId),
+		items,
+	};
+}
+
 // ---------------------------------------------------------------------------
 // Collaboration visibility & follow-up (leader ↔ worker)
 // ---------------------------------------------------------------------------

@@ -272,20 +272,6 @@ export function createHostApi(rpc, options = {}) {
 		return result && typeof result === "object" ? result.data ?? result : result;
 	}
 
-	/** Deliver a structured shared context record to multiple narrators. */
-	async function deliverNarratorContext(input, options = {}) {
-		const result = await executeCommand("narrafork.narrator.context.broadcast", input, {
-			idempotencyKey: options.idempotencyKey ?? input?.contextId,
-		});
-		return result && typeof result === "object" ? result.data ?? result : result;
-	}
-
-	/** Read delivery receipts for one context record. */
-	async function getNarratorContextDeliveries(input) {
-		const result = await executeQuery("narrafork.narrator.context.deliveries.list", input);
-		return result && typeof result === "object" ? result.data ?? result : result;
-	}
-
 	/**
 	 * Update a narrator's title / model / reasoning effort (at least one field).
 	 * model "__default__" follows the global default. Returns { updated: string[] }.
@@ -331,7 +317,5 @@ export function createHostApi(rpc, options = {}) {
 		interruptNarrator,
 		updateNarratorProfile,
 		specFileWrite,
-		deliverNarratorContext,
-		getNarratorContextDeliveries,
 	};
 }

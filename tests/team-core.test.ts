@@ -768,5 +768,83 @@ describe("shared context log", () => {
 		expect(result.ids.length).toBe(core.CONTEXT_LOG_LIMITS.maxEntries);
 		expect(result.ids[0]).toBe(ids[0]);
 	});
+
+	test("contextPrompt marks a handoff, not a closable task", () => {
+		const entry = core.parseContextEntry({
+			id: "ctx-9",
+			kind: "fact",
+			text: "Entry point is server/lib/rpc.js",
+			payload: { file: "server/lib/rpc.js" },
+			sourceNarratorId: "leader",
+			targetNarratorIds: ["worker"],
+			createdAt: NOW,
+		});
+		const prompt = core.contextPrompt(entry);
+		expect(prompt).toContain("[团队上下文 ctx-9（fact）]");
+		expect(prompt).toContain("Entry point is server/lib/rpc.js");
+		expect(prompt).toContain("- file: server/lib/rpc.js");
+		// The handoff must not read as a team task: the SOP only treats
+		// TEAM_TASK_MARKER-prefixed work as requiring team.report.
+		expect(prompt).not.toContain(TEAM_TASK_MARKER);
+	});
+
+	test("contextPrompt omits the payload block when there is none", () => {
+		const entry = core.parseContextEntry({
+			id: "ctx-10",
+			kind: "status",
+			text: "blocked on review",
+			sourceNarratorId: "worker",
+			targetNarratorIds: ["leader"],
+			createdAt: NOW,
+		});
+		expect(core.contextPrompt(entry)).not.toContain("附加信息");
+	});
+
+	test("parseContextDeliveries bounds and normalizes receipts", () => {
+		expect(core.parseContextDeliveries(null)).toEqual({ contextId: null, updatedAt: null, items: [] });
+		const receipt = core.parseContextDeliveries({
+			contextId: "ctx-1",
+			updatedAt: NOW,
+			items: [
+				{ narratorId: "n2", status: "delivered", messageId: "m1" },
+				{ narratorId: "n3", status: "not-a-status" },
+				{ status: "delivered" },
+				"junk",
+			],
+		});
+		expect(receipt.contextId).toBe("ctx-1");
+		expect(receipt.items).toEqual([
+			{ narratorId: "n2", status: "delivered", messageId: "m1", error: null },
+			{ narratorId: "n3", status: "failed", messageId: null, error: null },
+		]);
+	});
+
+	test("summarizeDeliveries counts outcomes and lists failures", () => {
+		const summary = core.summarizeDeliveries({
+			items: [
+				{ narratorId: "n2", status: "delivered" },
+				{ narratorId: "n3", status: "failed" },
+			],
+		});
+		expect(summary.total).toBe(2);
+		expect(summary.delivered).toBe(1);
+		expect(summary.failed).toEqual(["n3"]);
+	});
+
+	test("sameContextContent ignores createdAt so a retry stays idempotent", () => {
+		const base = {
+			id: "ctx-1",
+			kind: "fact",
+			text: "same handoff",
+			payload: { file: "a.js" },
+			sourceNarratorId: "leader",
+			targetNarratorIds: ["worker"],
+		};
+		expect(core.sameContextContent({ ...base, createdAt: "T1" }, { ...base, createdAt: "T2" })).toBe(true);
+		// Real content changes must still conflict.
+		expect(core.sameContextContent({ ...base, createdAt: "T1" }, { ...base, text: "changed", createdAt: "T1" })).toBe(false);
+		expect(core.sameContextContent({ ...base, createdAt: "T1" }, { ...base, targetNarratorIds: ["other"], createdAt: "T1" })).toBe(false);
+		expect(core.sameContextContent(null, base)).toBe(false);
+	});
 });
 

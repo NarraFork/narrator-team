@@ -43,6 +43,11 @@ const teamTasksIndexKey = (teamId) => `team.${teamId}.tasks.index`;
 const teamTaskKey = (teamId, seq) => `team.${teamId}.tasks.${seq}`;
 const teamContextIndexKey = (teamId) => `team.${teamId}.contexts.index`;
 const teamContextKey = (teamId, contextId) => `team.${teamId}.contexts.${encodeURIComponent(contextId)}`;
+// Delivery receipts used to be handed back by the host's context API. That API
+// is gone in NarraFork 0.7.7, so the plugin records its own per-target outcome
+// next to the context entry it describes.
+const teamContextDeliveriesKey = (teamId, contextId) =>
+	`team.${teamId}.contexts.${encodeURIComponent(contextId)}.deliveries`;
 const STATUS_QUEUE_WINDOW = 20;
 
 let initialized = false;
@@ -127,6 +132,14 @@ async function writeContextEntry(teamId, entry) {
 
 async function writeContextIndex(teamId, index) {
 	await host.storageSet(teamContextIndexKey(teamId), index);
+}
+
+async function readContextDeliveries(teamId, contextId) {
+	return core.parseContextDeliveries(await host.storageGet(teamContextDeliveriesKey(teamId, contextId)));
+}
+
+async function writeContextDeliveries(teamId, receipt) {
+	await host.storageSet(teamContextDeliveriesKey(teamId, receipt.contextId), receipt);
 }
 
 async function loadContextEntries(teamId, index, limit = core.CONTEXT_LOG_LIMITS.maxEntries) {
@@ -928,6 +941,18 @@ async function isSubagentNarrator(narratorId) {
 	}
 }
 
+/**
+ * Send a plain message to any team narrator, picking the channel by kind.
+ * Subagents have no direct message channel, so they only receive messages via
+ * send_subagent_message; primary narrators use send_message. Returns the host
+ * result (carries `messageId`).
+ */
+async function sendToNarrator(narratorId, message, options = {}) {
+	return (await isSubagentNarrator(narratorId))
+		? host.sendSubagentMessage(narratorId, message, options)
+		: host.sendMessage(narratorId, message, options);
+}
+
 async function buildTeamStatus(team, narratorSnapshot = undefined) {
 	const index = await readTeamIndex(team.id);
 	const snapshot = narratorSnapshot ?? (await readNarratorSnapshot());
@@ -1138,39 +1163,60 @@ async function broadcastContext(input, callerNarratorId, now = new Date().toISOS
 
 	const existing = await readContextEntry(team.id, entry.id);
 	if (existing) {
-		if (JSON.stringify(existing) !== JSON.stringify(entry)) return { ok: false, reason: `Context id already exists with different content: ${entry.id}` };
-		try {
-			const receipt = await host.getNarratorContextDeliveries({ contextId: entry.id });
-			return { ok: true, teamId: team.id, contextId: entry.id, status: "already_pending", receipt };
-		} catch {
-			return { ok: true, teamId: team.id, contextId: entry.id, status: "already_pending" };
-		}
+		// Idempotency is about the handoff's content, not the clock: re-sending
+		// the same record must not conflict just because `createdAt` moved. The
+		// stored entry keeps its original timestamp.
+		if (!core.sameContextContent(existing, entry)) return { ok: false, reason: `Context id already exists with different content: ${entry.id}` };
+		const receipt = core.summarizeDeliveries(await readContextDeliveries(team.id, entry.id));
+		return { ok: true, teamId: team.id, contextId: entry.id, status: "already_pending", receipt };
 	}
 
 	await writeContextEntry(team.id, entry);
 	const nextIndex = core.appendContextIndex(await readContextIndex(team.id), entry.id);
 	await writeContextIndex(team.id, nextIndex);
 	for (const trimmedId of nextIndex.trimmed) {
+		// Retention cleanup is best-effort; the bounded index remains authoritative.
 		try {
 			await host.storageDelete(teamContextKey(team.id, trimmedId));
 		} catch {
-			// Retention cleanup is best-effort; the bounded index remains authoritative.
+			// ignore
+		}
+		try {
+			await host.storageDelete(teamContextDeliveriesKey(team.id, trimmedId));
+		} catch {
+			// ignore
 		}
 	}
-	try {
-		const result = await host.deliverNarratorContext({
-			contextId: entry.id,
-			kind: entry.kind,
-			text: entry.text,
-			payload: entry.payload,
-			sourceNarratorId: entry.sourceNarratorId,
-			targetNarratorIds: entry.targetNarratorIds,
-			createdAt: entry.createdAt,
-		}, { idempotencyKey: entry.id });
-		return { ok: true, teamId: team.id, contextId: entry.id, status: result?.status ?? "accepted", deliveries: result?.deliveries ?? [] };
-	} catch (error) {
-		return { ok: false, reason: `Context delivery failed: ${error.message}`, contextId: entry.id, persisted: true };
+
+	// NarraFork 0.7.7 exposes no structured context-delivery channel to plugins,
+	// so the record travels as an ordinary message to each target and the receipt
+	// is recorded plugin-side. Delivery stays best-effort per target: one busy or
+	// unreachable member must not sink the whole broadcast, and the Leader reads
+	// the per-target outcome from the returned summary.
+	const prompt = core.contextPrompt(entry);
+	const items = [];
+	for (const target of targets) {
+		const item = { narratorId: target, status: "failed", messageId: null, error: null };
+		try {
+			const result = await sendToNarrator(target, prompt, { idempotencyKey: `${entry.id}:${target}` });
+			item.status = "delivered";
+			item.messageId = result && typeof result.messageId === "string" ? result.messageId : null;
+		} catch (error) {
+			item.error = `${error.code ?? "HOST_ERROR"}: ${error.message}`;
+		}
+		items.push(item);
 	}
+	const receipt = { contextId: entry.id, updatedAt: now, items };
+	await writeContextDeliveries(team.id, receipt);
+	const summary = core.summarizeDeliveries(receipt);
+	return {
+		ok: true,
+		teamId: team.id,
+		contextId: entry.id,
+		status: summary.delivered === summary.total ? "delivered" : summary.delivered > 0 ? "partial" : "failed",
+		delivered: summary.delivered,
+		failed: summary.failed,
+	};
 }
 
 async function listContextLog(input, callerNarratorId) {
